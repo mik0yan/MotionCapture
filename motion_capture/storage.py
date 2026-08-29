@@ -8,7 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from motion_capture.config import AppConfig, NDIConfig, Open3DConfig, build_realsense_config
+from motion_capture.config import (
+    AppConfig,
+    FFmpegConfig,
+    NDIConfig,
+    Open3DConfig,
+    build_realsense_config,
+)
 from motion_capture.models import PoseSample
 
 
@@ -104,6 +110,7 @@ class AppDatabase:
                 "rom_files": [str(path) for path in config.ndi.rom_files],
             },
             "open3d": asdict(config.open3d),
+            "ffmpeg": asdict(config.ffmpeg),
         }
         self.connection.execute(
             """
@@ -154,6 +161,7 @@ class AppDatabase:
                 record_format=str(ndi_data["record_format"]),
             )
             open3d = Open3DConfig(**payload["open3d"])
+            ffmpeg = FFmpegConfig(**payload.get("ffmpeg", asdict(fallback.ffmpeg)))
             source = str(payload["source"])
             if source not in {"simulator", "realsense", "ndi"}:
                 raise ValueError("SQLite 中的 source 无效")
@@ -165,6 +173,7 @@ class AppDatabase:
                 realsense=realsense,
                 ndi=ndi,
                 open3d=open3d,
+                ffmpeg=ffmpeg,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError(f"SQLite 运行配置损坏：{exc}") from exc

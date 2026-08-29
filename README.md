@@ -23,6 +23,8 @@ python main.py
 
 默认 `.env` 使用 `MOCAP_SOURCE=simulator`，可在没有硬件时直接验收界面、轨迹和录制功能。
 
+视频录制依赖本机 FFmpeg。macOS 可使用 `brew install ffmpeg`，随后用 `ffmpeg -version` 确认命令可执行；也可通过 `FFMPEG_PATH` 配置绝对路径。
+
 主界面按 Figma `01 · RealSense 实时监控 · 监控功能` 重构：左侧为 1280×720 监控画面、RGB/D/Tag 图层开关、录制计时和实时指标，右侧为独立 AprilTag 监控卡及设置页。设置页可切换 `RealSense（USB）`、`NDI（IP/串口）` 和 `模拟器`，连接期间会锁定配置。
 
 每张 AprilTag 卡片直接显示 XYZ、相机距离偏移量和最近 5 秒位置方差；长按卡片至少 500 ms 可单独修改该 ID 的实际尺寸与质量阈值。运行中修改尺寸会立即用于该 Tag 的后续 PnP 解算，并持久化到本地 SQLite。
@@ -146,14 +148,23 @@ python -m pip install scikit-surgerynditracker
 
 NDI 位姿矩阵中的平移按 SDK 约定作为 mm 原样记录。采集与对齐应优先使用 NDI `frame_number`，不要把主机时钟当成硬件采样时钟。
 
-## 轨迹输出
+## 本地 FFmpeg 视频与轨迹输出
 
-录制文件默认写到 `recordings/`，公共字段包括 UTC 时间、来源、工具、硬件帧号、有效性、质量和 XYZ。NDI 模式根据表单追加四元数或 3×3 方向余弦矩阵，并输出 CSV 或 XLSX；RealSense 默认输出仅含位置的 XLSX，也可在表单切换为 CSV；模拟器默认输出 CSV + 四元数。`.env` 中可通过 `MOCAP_RECORD_DIR` 修改目录。
+点击画面内录制按钮后，RealSense/模拟器的 RGB 帧通过后台队列写入本机 FFmpeg，默认使用 `libx264` 编码为兼容性较好的 `yuv420p` MP4；停止后执行 `+faststart` 封装并生成同名 JSON 元数据。视频先写入隐藏的 `.partial.mp4`，只有 FFmpeg 正常结束后才改名为正式文件。NDI 当前后端只提供位姿数据、不提供视频帧，因此保持轨迹记录。
+
+视频与轨迹文件使用同一录制编号，例如：
+
+```text
+recordings/capture_20260829_143218_123456.mp4
+recordings/capture_20260829_143218_123456.json
+recordings/capture_20260829_143218_123456.xlsx
+```
+
+轨迹公共字段包括 UTC 时间、来源、工具、硬件帧号、有效性、质量和 XYZ。NDI 模式根据表单追加四元数或 3×3 方向余弦矩阵，并输出 CSV 或 XLSX；RealSense 默认输出仅含位置的 XLSX，也可在表单切换为 CSV；模拟器默认输出 CSV。`.env` 中可通过 `MOCAP_RECORD_DIR` 修改目录，通过 `FFMPEG_VIDEO_ENABLED`、`FFMPEG_PATH`、`FFMPEG_VIDEO_CODEC`、`FFMPEG_VIDEO_PRESET` 和 `FFMPEG_VIDEO_CRF` 调整本地视频编码。
 
 ## 测试
 
 ```bash
-python -m pip install pytest
 python -m pytest
 ```
 

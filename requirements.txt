@@ -1,6 +1,15 @@
-PyQt5>=5.15.10,<5.16
-numpy>=1.26,<2
-opencv-contrib-python>=4.9,<5
-python-dotenv>=1.0,<2
-open3d>=0.19,<0.20
-openpyxl>=3.1,<4
+# Application runtime (versions validated with Python 3.11 on macOS arm64)
+PyQt5==5.15.11
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+python-dotenv==1.2.3
+open3d==0.19.0
+openpyxl==3.1.5
+scikit-surgerynditracker==1.0.1
+
+# RealSense publishes Linux/Windows wheels but no macOS wheel. On macOS,
+# install the locally built librealsense binding with tools/install_pyrealsense2.sh.
+pyrealsense2==2.57.7.10387; sys_platform != "darwin"
+
+# Test suite
+pytest==8.2.0

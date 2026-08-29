@@ -28,6 +28,10 @@ def test_loads_relative_paths_from_project_root(tmp_path: Path) -> None:
     assert config.ndi.rom_files == (tmp_path / "roms/a.rom", tmp_path / "roms/b.rom")
     assert config.open3d.enabled is True
     assert config.open3d.render_hz == 15
+    assert config.ffmpeg.enabled is True
+    assert config.ffmpeg.executable == "ffmpeg"
+    assert config.ffmpeg.codec == "libx264"
+    assert config.ffmpeg.crf == 18
 
 
 def test_rejects_board_shape_mismatch(tmp_path: Path) -> None:
@@ -42,6 +46,12 @@ def test_rejects_board_shape_mismatch(tmp_path: Path) -> None:
 def test_rejects_invalid_open3d_boolean(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text("OPEN3D_ENABLED=maybe\n", encoding="utf-8")
     with pytest.raises(ValueError, match="OPEN3D_ENABLED"):
+        load_config(tmp_path, environ={})
+
+
+def test_rejects_invalid_ffmpeg_crf(tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text("FFMPEG_VIDEO_CRF=52\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="FFMPEG_VIDEO_CRF"):
         load_config(tmp_path, environ={})
 
 

@@ -82,6 +82,15 @@ class Open3DConfig:
 
 
 @dataclass(frozen=True)
+class FFmpegConfig:
+    enabled: bool
+    executable: str
+    codec: str
+    preset: str
+    crf: int
+
+
+@dataclass(frozen=True)
 class AppConfig:
     root: Path
     source: str
@@ -90,6 +99,7 @@ class AppConfig:
     realsense: RealSenseConfig
     ndi: NDIConfig
     open3d: Open3DConfig
+    ffmpeg: FFmpegConfig
     database_path: Path
 
 
@@ -370,6 +380,22 @@ def load_config(root: Path | None = None, environ: Mapping[str, str] | None = No
     if not 20 <= open3d.camera_fov_deg <= 90:
         raise ValueError("OPEN3D_CAMERA_FOV_DEG 必须在 20 到 90 之间")
 
+    ffmpeg = FFmpegConfig(
+        enabled=_boolean(values, "FFMPEG_VIDEO_ENABLED", True),
+        executable=values.get("FFMPEG_PATH", "ffmpeg").strip(),
+        codec=values.get("FFMPEG_VIDEO_CODEC", "libx264").strip(),
+        preset=values.get("FFMPEG_VIDEO_PRESET", "veryfast").strip(),
+        crf=_integer(values, "FFMPEG_VIDEO_CRF", 18),
+    )
+    if not ffmpeg.executable:
+        raise ValueError("FFMPEG_PATH 不能为空")
+    if not ffmpeg.codec:
+        raise ValueError("FFMPEG_VIDEO_CODEC 不能为空")
+    if ffmpeg.codec == "libx264" and not ffmpeg.preset:
+        raise ValueError("FFMPEG_VIDEO_PRESET 不能为空")
+    if not 0 <= ffmpeg.crf <= 51:
+        raise ValueError("FFMPEG_VIDEO_CRF 必须在 0 到 51 之间")
+
     record_value = Path(values.get("MOCAP_RECORD_DIR", "recordings")).expanduser()
     record_dir = record_value if record_value.is_absolute() else root / record_value
     poll_hz = _integer(values, "MOCAP_POLL_HZ", 30)
@@ -385,5 +411,6 @@ def load_config(root: Path | None = None, environ: Mapping[str, str] | None = No
         realsense,
         ndi,
         open3d,
+        ffmpeg,
         database_path.resolve(),
     )

@@ -1,9 +1,5 @@
 -r requirements.txt
 
-# macOS arm64 上 PyPI 没有 pyrealsense2 轮子，pip 会直接报 No matching distribution。
-# 需本地编译 librealsense 后用 tools/install_pyrealsense2.sh 装进 venv，
-# 因此这里不声明 pyrealsense2，避免整个文件安装失败。
-# Linux / Windows / macOS x86_64 可直接放开下面一行：
-# pyrealsense2>=2.55
-
-scikit-surgerynditracker>=1.0.1
+# NDI 与非 macOS 平台的 RealSense 依赖已锁定在 requirements.txt。
+# macOS 没有 pyrealsense2 wheel；请运行 tools/install_pyrealsense2.sh
+# 安装与本地 librealsense v2.57.7 源码匹配的绑定。

@@ -8,13 +8,18 @@ version = "0.1.0"
 description = "PyQt5 motion capture UI for RealSense AprilTag boards and NDI ROM tools"
 requires-python = ">=3.10"
 dependencies = [
-  "PyQt5>=5.15.10,<5.16",
-  "numpy>=1.26,<2",
-  "opencv-contrib-python>=4.9,<5",
-  "python-dotenv>=1.0,<2",
-  "open3d>=0.19,<0.20",
-  "openpyxl>=3.1,<4",
+  "PyQt5==5.15.11",
+  "numpy==1.26.4",
+  "opencv-contrib-python==4.11.0.86",
+  "python-dotenv==1.2.3",
+  "open3d==0.19.0",
+  "openpyxl==3.1.5",
+  "scikit-surgerynditracker==1.0.1",
+  "pyrealsense2==2.57.7.10387; sys_platform != 'darwin'",
 ]
+
+[project.optional-dependencies]
+test = ["pytest==8.2.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -17,6 +17,14 @@ def test_recorder_writes_pose(tmp_path: Path) -> None:
     assert ",test,tool,7,1,0.900000,1.000000,2.000000,3.000000," in text
 
 
+def test_recorder_accepts_shared_capture_stem(tmp_path: Path) -> None:
+    recorder = CSVRecorder(tmp_path)
+    path = recorder.start("capture_shared")
+    recorder.stop()
+
+    assert path == tmp_path / "capture_shared.csv"
+
+
 def test_csv_recorder_can_write_direction_cosine_matrix(tmp_path: Path) -> None:
     recorder = TrajectoryRecorder(tmp_path, file_format="csv", orientation="matrix")
     path = recorder.start()

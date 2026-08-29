@@ -70,12 +70,14 @@ class TrajectoryRecorder:
         self.file_format = normalized_format
         self.orientation = normalized_orientation
 
-    def start(self) -> Path:
+    def start(self, stem: str | None = None) -> Path:
         if self.active:
             raise RuntimeError("轨迹录制已经开始")
         self.directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self.path = self.directory / f"motion_{timestamp}.{self.file_format}"
+        recording_stem = stem or f"motion_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        self.path = self.directory / f"{recording_stem}.{self.file_format}"
+        if self.path.exists():
+            raise FileExistsError(f"轨迹文件已存在：{self.path}")
         if self.file_format == "csv":
             self._file = self.path.open("w", newline="", encoding="utf-8-sig")
             self._csv_writer = csv.writer(self._file)

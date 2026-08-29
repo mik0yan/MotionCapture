@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from collections import deque
 from dataclasses import replace
@@ -32,6 +33,7 @@ from motion_capture.storage import AppDatabase, TagMonitorProfile
 from motion_capture.ui.monitor_widgets import CameraView, MetricCard, TagMonitorCard, app_font
 from motion_capture.ui.open3d_view import Open3DViewWidget
 from motion_capture.ui.settings_panel import SettingsPanel
+from motion_capture.video_recorder import FFmpegVideoRecorder, VideoRecordingResult
 from motion_capture.worker import TrackingWorker
 
 
@@ -48,10 +50,14 @@ class MainWindow(QMainWindow):
         self.database = database or AppDatabase(config.database_path)
         self.worker: TrackingWorker | None = None
         self.recorder = TrajectoryRecorder(config.record_dir)
+        self.video_recorder = FFmpegVideoRecorder(config.record_dir, config.ffmpeg)
         self._session_id: int | None = None
         self._session_device_name = ""
         self._session_failed = False
         self._last_export_path: Path | None = None
+        self._last_data_path: Path | None = None
+        self._last_video_result: VideoRecordingResult | None = None
+        self._last_video_shape: tuple[int, int, int] | None = None
         self._frame_times: deque[float] = deque(maxlen=90)
         self._last_packet_at: float | None = None
         self._last_samples: dict[str, PoseSample] = {}
@@ -273,6 +279,8 @@ class MainWindow(QMainWindow):
             return False
         self.config = updated
         self.recorder.directory = updated.record_dir
+        self.video_recorder.directory = updated.record_dir
+        self.video_recorder.config = updated.ffmpeg
         self.settings_panel.load_config(updated)
         self._reload_tag_cards()
         self._sync_source_ui()
@@ -361,6 +369,12 @@ class MainWindow(QMainWindow):
 
         self._update_tag_monitors(packet.samples, now)
         self.camera_view.canvas.set_frame(packet.image_rgb, packet.tag_detections, self._tag_tones)
+        if packet.image_rgb is not None:
+            self._last_video_shape = (
+                int(packet.image_rgb.shape[0]),
+                int(packet.image_rgb.shape[1]),
+                int(packet.image_rgb.shape[2]),
+            )
         if self._session_id is not None:
             self.database.record_samples(self._session_id, packet.samples)
         if self.recorder.active:
@@ -371,6 +385,12 @@ class MainWindow(QMainWindow):
             else:
                 recorded = packet.samples
             self.recorder.write(recorded)
+        if self.video_recorder.active and packet.image_rgb is not None:
+            try:
+                self.video_recorder.write_frame(packet.image_rgb)
+            except (OSError, RuntimeError, ValueError) as exc:
+                self._stop_recording(show_dialog=False)
+                QMessageBox.critical(self, "视频录制已停止", str(exc))
 
     def _update_tag_monitors(self, samples: tuple[PoseSample, ...], now: float) -> None:
         by_tag: dict[int, PoseSample] = {}
@@ -473,12 +493,7 @@ class MainWindow(QMainWindow):
         if self.worker is None or not self.worker.isRunning():
             return
         if self.recorder.active:
-            path = self.recorder.stop()
-            self._last_export_path = path
-            self._record_started_at = None
-            self.camera_view.set_recording(False, 0)
-            if path is not None:
-                QMessageBox.information(self, "录制已保存", str(path))
+            self._stop_recording(show_dialog=True)
             return
         if self.config.source == "ndi":
             file_format = self.config.ndi.record_format
@@ -489,14 +504,74 @@ class MainWindow(QMainWindow):
         else:
             file_format = "csv"
             orientation = "position"
+        video_required = self.config.ffmpeg.enabled and self.config.source in {
+            "realsense",
+            "simulator",
+        }
+        if video_required and self._last_video_shape is None:
+            QMessageBox.warning(self, "无法开始录制", "尚未收到 RGB 视频帧，请等待画面显示后重试。")
+            return
+        stem = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
         try:
+            if video_required:
+                height, width, channels = self._last_video_shape
+                if channels != 3:
+                    raise ValueError(f"RGB 视频帧必须为 3 通道，当前为 {channels} 通道")
+                fps = (
+                    self.config.realsense.fps
+                    if self.config.source == "realsense"
+                    else self.config.poll_hz
+                )
+                self.video_recorder.start(width, height, fps, stem)
             self.recorder.configure(file_format, orientation)
-            self.recorder.start()
+            self.recorder.start(stem)
         except (OSError, RuntimeError, ValueError) as exc:
+            if self.video_recorder.active:
+                try:
+                    self.video_recorder.stop()
+                except RuntimeError:
+                    pass
             QMessageBox.warning(self, "无法开始录制", str(exc))
             return
+        self._last_data_path = None
+        self._last_video_result = None
         self._record_started_at = time.monotonic()
         self.camera_view.set_recording(True, 0)
+
+    def _stop_recording(self, *, show_dialog: bool) -> None:
+        errors: list[str] = []
+        data_path: Path | None = None
+        video_result: VideoRecordingResult | None = None
+        if self.recorder.active:
+            try:
+                data_path = self.recorder.stop()
+            except (OSError, RuntimeError) as exc:
+                errors.append(f"轨迹：{exc}")
+        if self.video_recorder.active:
+            try:
+                video_result = self.video_recorder.stop()
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                errors.append(f"视频：{exc}")
+        self._last_data_path = data_path
+        self._last_video_result = video_result
+        self._last_export_path = video_result.path if video_result is not None else data_path
+        self._record_started_at = None
+        self.camera_view.set_recording(False, 0)
+        if not show_dialog:
+            return
+        if errors:
+            QMessageBox.warning(self, "录制停止时发生错误", "\n".join(errors))
+            return
+        saved = []
+        if video_result is not None:
+            saved.append(f"视频：{video_result.path}")
+            saved.append(
+                f"视频帧：{video_result.frames_written}，丢弃：{video_result.frames_dropped}"
+            )
+        if data_path is not None:
+            saved.append(f"轨迹：{data_path}")
+        if saved:
+            QMessageBox.information(self, "录制已保存", "\n".join(saved))
 
     def _toggle_realsense_calibration(self) -> None:
         if self._rs_calibration_samples is not None:
@@ -598,8 +673,8 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "设备错误", message)
 
     def _on_stopped(self) -> None:
-        if self.recorder.active:
-            self._last_export_path = self.recorder.stop()
+        if self.recorder.active or self.video_recorder.active:
+            self._stop_recording(show_dialog=False)
         if self._session_id is not None:
             self.database.end_session(
                 self._session_id,
@@ -649,6 +724,7 @@ class MainWindow(QMainWindow):
         self._frame_times.clear()
         self._last_packet_at = None
         self._last_samples.clear()
+        self._last_video_shape = None
         self._tag_tones.clear()
         for history in self._tag_histories.values():
             history.clear()
@@ -665,8 +741,8 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         self._closed = True
-        if self.recorder.active:
-            self._last_export_path = self.recorder.stop()
+        if self.recorder.active or self.video_recorder.active:
+            self._stop_recording(show_dialog=False)
         if self.worker is not None and self.worker.isRunning():
             self.worker.requestInterruption()
             self.worker.wait(2500)
