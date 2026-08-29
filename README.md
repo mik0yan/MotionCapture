@@ -25,6 +25,18 @@ python main.py
 
 视频录制依赖本机 FFmpeg。macOS 可使用 `brew install ffmpeg`，随后用 `ffmpeg -version` 确认命令可执行；也可通过 `FFMPEG_PATH` 配置绝对路径。
 
+### 平台兼容性
+
+`requirements.txt` 使用精确版本和 PEP 508 平台条件，目标安装矩阵如下：
+
+| 平台 | Python | `pip install -r requirements.txt` | RealSense | FFmpeg |
+| --- | --- | --- | --- | --- |
+| macOS 11+ Intel / Apple Silicon | 3.10–3.12 | 支持 | 运行 `tools/install_pyrealsense2.sh` 安装本地编译绑定 | Homebrew 或配置 `FFMPEG_PATH` |
+| Windows 10/11 x64 | 3.10–3.12 | 支持 | requirements 自动安装锁定 wheel | 单独安装并加入 `PATH` |
+| Linux x86_64，glibc 2.31+ | 3.10–3.12 | 支持 | requirements 自动安装锁定 wheel | 使用系统包管理器安装 |
+
+Linux ARM64 和 Windows ARM64 缺少当前锁定版本完整的 PyQt5、Open3D、RealSense 官方 wheel 组合，不属于本锁定文件的直接安装矩阵，需要自行编译对应依赖。FFmpeg 是系统程序而不是 Python 库，因此不使用 PyPI 上名称相似的包替代。
+
 主界面按 Figma `01 · RealSense 实时监控 · 监控功能` 重构：左侧为 1280×720 监控画面、RGB/D/Tag 图层开关、录制计时和实时指标，右侧为独立 AprilTag 监控卡及设置页。设置页可切换 `RealSense（USB）`、`NDI（IP/串口）` 和 `模拟器`，连接期间会锁定配置。
 
 每张 AprilTag 卡片直接显示 XYZ、相机距离偏移量和最近 5 秒位置方差；长按卡片至少 500 ms 可单独修改该 ID 的实际尺寸与质量阈值。运行中修改尺寸会立即用于该 Tag 的后续 PnP 解算，并持久化到本地 SQLite。

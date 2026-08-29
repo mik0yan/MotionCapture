@@ -1,4 +1,7 @@
-# Application runtime (versions validated with Python 3.11 on macOS arm64)
+# Cross-platform locked runtime.
+# Supported: Python 3.10-3.12 on macOS 11+ (x86_64/arm64), Windows x64,
+# and Linux x86_64 with glibc 2.31+. Linux/Windows ARM64 requires a custom
+# PyQt5/Open3D build and is intentionally outside this lock file's matrix.
 PyQt5==5.15.11
 numpy==1.26.4
 opencv-contrib-python==4.11.0.86
@@ -7,9 +10,11 @@ open3d==0.19.0
 openpyxl==3.1.5
 scikit-surgerynditracker==1.0.1
 
-# RealSense publishes Linux/Windows wheels but no macOS wheel. On macOS,
-# install the locally built librealsense binding with tools/install_pyrealsense2.sh.
-pyrealsense2==2.57.7.10387; sys_platform != "darwin"
+# RealSense publishes wheels for Windows x64 and Linux x86_64, but not macOS.
+# On macOS install the matching local librealsense binding with
+# tools/install_pyrealsense2.sh. Explicit machine markers prevent pip from
+# trying an incompatible wheel on Windows ARM64 or Linux ARM64/Python 3.11.
+pyrealsense2==2.57.7.10387; (sys_platform == "win32" and (platform_machine == "AMD64" or platform_machine == "x86_64")) or (sys_platform == "linux" and platform_machine == "x86_64")
 
 # Test suite
 pytest==8.2.0

@@ -1,5 +1,6 @@
 -r requirements.txt
 
-# NDI 与非 macOS 平台的 RealSense 依赖已锁定在 requirements.txt。
+# NDI 以及 Windows/Linux x64 的 RealSense 依赖已锁定在 requirements.txt。
 # macOS 没有 pyrealsense2 wheel；请运行 tools/install_pyrealsense2.sh
 # 安装与本地 librealsense v2.57.7 源码匹配的绑定。
+# Linux ARM64 / Windows ARM64 不属于当前预编译 wheel 支持矩阵。
