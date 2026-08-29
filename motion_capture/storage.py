@@ -30,7 +30,7 @@ class TagMonitorProfile:
 class AppDatabase:
     """Local SQLite persistence for settings, monitor profiles and capture history."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path).expanduser().resolve()
@@ -43,7 +43,35 @@ class AppDatabase:
         self._last_commit = time.monotonic()
         self._create_schema()
 
+    def _migrate_tag_monitors_unbounded_threshold(self) -> None:
+        version = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
+        if version >= self.SCHEMA_VERSION:
+            return
+        table = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tag_monitors'"
+        ).fetchone()
+        if table is None or "quality_threshold <= 1" not in (table[0] or ""):
+            return
+        self.connection.executescript(
+            """
+            CREATE TABLE tag_monitors_migrated (
+                tag_id INTEGER PRIMARY KEY,
+                tag_size_mm REAL NOT NULL CHECK(tag_size_mm > 0),
+                quality_threshold REAL NOT NULL CHECK(quality_threshold >= 0),
+                warning_distance_mm REAL NOT NULL CHECK(warning_distance_mm >= 0),
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO tag_monitors_migrated
+                SELECT tag_id, tag_size_mm, quality_threshold, warning_distance_mm, enabled, updated_at
+                FROM tag_monitors;
+            DROP TABLE tag_monitors;
+            ALTER TABLE tag_monitors_migrated RENAME TO tag_monitors;
+            """
+        )
+
     def _create_schema(self) -> None:
+        self._migrate_tag_monitors_unbounded_threshold()
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS app_settings (
@@ -55,7 +83,7 @@ class AppDatabase:
             CREATE TABLE IF NOT EXISTS tag_monitors (
                 tag_id INTEGER PRIMARY KEY,
                 tag_size_mm REAL NOT NULL CHECK(tag_size_mm > 0),
-                quality_threshold REAL NOT NULL CHECK(quality_threshold >= 0 AND quality_threshold <= 1),
+                quality_threshold REAL NOT NULL CHECK(quality_threshold >= 0),
                 warning_distance_mm REAL NOT NULL CHECK(warning_distance_mm >= 0),
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
                 updated_at TEXT NOT NULL
@@ -184,7 +212,7 @@ class AppDatabase:
             """
             INSERT OR IGNORE INTO tag_monitors(
                 tag_id, tag_size_mm, quality_threshold, warning_distance_mm, enabled, updated_at
-            ) VALUES(?, ?, 0.72, 80.0, 1, ?)
+            ) VALUES(?, ?, 5.0, 80.0, 1, ?)
             """,
             ((int(tag_id), float(tag_size_mm), now) for tag_id in tag_ids),
         )
@@ -212,6 +240,13 @@ class AppDatabase:
             )
             for row in rows
         )
+
+    def enable_all_tag_monitors(self) -> None:
+        self.connection.execute(
+            "UPDATE tag_monitors SET enabled = 1, updated_at = ? WHERE enabled = 0",
+            (self._now(),),
+        )
+        self.connection.commit()
 
     def save_tag_monitor(self, profile: TagMonitorProfile) -> None:
         self.connection.execute(

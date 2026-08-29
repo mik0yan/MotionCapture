@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QDialog,
     QDialogButtonBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QScrollArea,
@@ -64,6 +66,7 @@ class MainWindow(QMainWindow):
         self._tag_cards: dict[int, TagMonitorCard] = {}
         self._tag_profiles: dict[int, TagMonitorProfile] = {}
         self._tag_histories: dict[int, deque[tuple[float, np.ndarray]]] = {}
+        self._tag_reference_positions: dict[int, np.ndarray] = {}
         self._tag_tones: dict[int, str] = {}
         self._rs_calibration_samples: list[PoseSample] | None = None
         self._rs_calibration_frames: set[int] = set()
@@ -77,6 +80,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1120, 760)
         self._build_ui()
         self._apply_style()
+        # 每次启动全部 Tag 重新开始监控，警告状态由本会话数据重新判读，不沿用上次保存的开关
+        self.database.enable_all_tag_monitors()
         self._reload_tag_cards()
         self._sync_source_ui()
 
@@ -106,6 +111,13 @@ class MainWindow(QMainWindow):
         separator.setObjectName("headerSeparator")
         separator.setFixedSize(1, 24)
         header_layout.addWidget(separator)
+        self.source_switcher = QComboBox()
+        self.source_switcher.setObjectName("sourceSwitcher")
+        self.source_switcher.addItem("RealSense 相机", "realsense")
+        self.source_switcher.addItem("NDI 光学定位", "ndi")
+        self.source_switcher.addItem("模拟器模式", "simulator")
+        self.source_switcher.currentIndexChanged.connect(self._on_switcher_changed)
+        header_layout.addWidget(self.source_switcher)
         self.device_label = QLabel()
         self.device_label.setObjectName("deviceLabel")
         header_layout.addWidget(self.device_label, 1)
@@ -233,6 +245,7 @@ class MainWindow(QMainWindow):
             card = TagMonitorCard(profile)
             card.monitor_toggled.connect(self._on_monitor_toggled)
             card.settings_requested.connect(self._edit_tag_profile)
+            card.threshold_changed.connect(self._on_tag_threshold_changed)
             self.monitor_cards_layout.insertWidget(self.monitor_cards_layout.count() - 1, card)
             self._tag_cards[profile.tag_id] = card
             self._tag_histories.setdefault(profile.tag_id, deque())
@@ -243,6 +256,11 @@ class MainWindow(QMainWindow):
             self.monitor_cards_layout.insertWidget(0, empty)
 
     def _sync_source_ui(self) -> None:
+        self.source_switcher.blockSignals(True)
+        self.source_switcher.setCurrentIndex(
+            max(0, self.source_switcher.findData(self.config.source))
+        )
+        self.source_switcher.blockSignals(False)
         self.device_label.setText(self.SOURCE_NAMES[self.config.source])
         self.settings_panel.load_config(self.config)
         if self.config.source == "realsense":
@@ -253,6 +271,9 @@ class MainWindow(QMainWindow):
             self.resolution_card.set_value("1280 × 720")
         else:
             self.resolution_card.set_value("位置数据")
+
+    def _on_switcher_changed(self) -> None:
+        self._on_source_changed(str(self.source_switcher.currentData()))
 
     def _on_source_changed(self, source: str) -> None:
         if source == self.config.source:
@@ -299,6 +320,7 @@ class MainWindow(QMainWindow):
             return
         self._reset_live_state()
         self.settings_panel.set_connecting()
+        self.source_switcher.setEnabled(False)
         self.camera_view.set_record_enabled(False)
         self._set_device_status("connecting", "● 正在连接")
         self._session_failed = False
@@ -414,12 +436,24 @@ class MainWindow(QMainWindow):
                 self._tag_tones[tag_id] = "danger"
                 continue
             position = np.asarray(sample.position_mm, dtype=float)
+            reference = self._tag_reference_positions.get(tag_id)
+            if reference is None and sample.valid:
+                reference = position.copy()
+                self._tag_reference_positions[tag_id] = reference
+            offset_mm = (
+                float(np.linalg.norm(position - reference)) if reference is not None else None
+            )
             history = self._tag_histories.setdefault(tag_id, deque())
             history.append((now, position.copy()))
             while history and now - history[0][0] > 5.0:
                 history.popleft()
             variance_axis = np.var([item[1] for item in history], axis=0)
             variance_mm = float(np.sqrt(np.mean(variance_axis)))
+            # 状态判读用 5s 均值位置对基准的偏移（抗抖动），显示仍用实时偏移 offset_mm
+            mean_position = np.mean([item[1] for item in history], axis=0)
+            judged_offset = (
+                float(np.linalg.norm(mean_position - reference)) if reference is not None else 0.0
+            )
             profile = self._tag_profiles[tag_id]
             quality = 1.0 if sample.quality is None else sample.quality
             camera_distance = float(np.linalg.norm(position))
@@ -429,24 +463,48 @@ class MainWindow(QMainWindow):
                 distance_tone = "proximity"
             else:
                 distance_tone = "normal"
-            if not sample.valid or quality < profile.quality_threshold:
+            if judged_offset >= profile.quality_threshold:
+                offset_tone = "danger"
+            elif judged_offset >= profile.quality_threshold * 0.5:
+                offset_tone = "proximity"
+            else:
+                offset_tone = "normal"
+            if not sample.valid:
                 quality_tone = "danger"
-            elif quality < min(1.0, profile.quality_threshold + 0.1):
-                quality_tone = "proximity"
             else:
                 quality_tone = "normal"
             severity = {"normal": 0, "proximity": 1, "danger": 2}
-            tone = max((distance_tone, quality_tone), key=severity.__getitem__)
+            tone = max((distance_tone, quality_tone, offset_tone), key=severity.__getitem__)
             self._tag_tones[tag_id] = tone
-            card.update_values(sample.position_mm, camera_distance, variance_mm, tone)
+            card.update_values(sample.position_mm, offset_mm, variance_mm, tone)
 
     def _on_monitor_toggled(self, tag_id: int, running: bool) -> None:
         current = self._tag_profiles[tag_id]
         updated = replace(current, enabled=running)
-        self.database.save_tag_monitor(updated)
+        try:
+            self.database.save_tag_monitor(updated)
+        except sqlite3.Error as exc:
+            QMessageBox.warning(self, "监控状态保存失败", f"本次运行内生效，但未能写入数据库：{exc}")
         self._tag_profiles[tag_id] = updated
+        self._tag_reference_positions.pop(tag_id, None)
         if running:
             self._tag_histories[tag_id] = deque()
+            sample = self._last_samples.get(f"tag_{tag_id}")
+            if sample is not None and sample.valid:
+                self._tag_reference_positions[tag_id] = np.asarray(
+                    sample.position_mm, dtype=float
+                ).copy()
+
+    def _on_tag_threshold_changed(self, tag_id: int, value: float) -> None:
+        current = self._tag_profiles.get(tag_id)
+        if current is None or current.quality_threshold == value:
+            return
+        updated = replace(current, quality_threshold=value)
+        try:
+            self.database.save_tag_monitor(updated)
+        except sqlite3.Error as exc:
+            QMessageBox.warning(self, "阈值保存失败", f"本次运行内生效，但未能写入数据库：{exc}")
+        self._tag_profiles[tag_id] = updated
 
     def _edit_tag_profile(self, tag_id: int) -> None:
         profile = self._tag_profiles[tag_id]
@@ -463,9 +521,10 @@ class MainWindow(QMainWindow):
         size_spin.setSuffix(" mm")
         size_spin.setValue(profile.tag_size_mm)
         threshold_spin = QDoubleSpinBox()
-        threshold_spin.setRange(0.0, 1.0)
+        threshold_spin.setRange(0.0, float("inf"))
         threshold_spin.setDecimals(2)
         threshold_spin.setSingleStep(0.01)
+        threshold_spin.setSuffix(" mm")
         threshold_spin.setValue(profile.quality_threshold)
         form.addRow("Tag 尺寸", size_spin)
         form.addRow("监控阈值", threshold_spin)
@@ -483,7 +542,10 @@ class MainWindow(QMainWindow):
             tag_size_mm=size_spin.value(),
             quality_threshold=threshold_spin.value(),
         )
-        self.database.save_tag_monitor(updated)
+        try:
+            self.database.save_tag_monitor(updated)
+        except sqlite3.Error as exc:
+            QMessageBox.warning(self, "监控设置保存失败", f"本次运行内生效，但未能写入数据库：{exc}")
         self._tag_profiles[tag_id] = updated
         self._tag_cards[tag_id].set_profile(updated)
         if self.worker is not None and self.worker.isRunning():
@@ -689,6 +751,7 @@ class MainWindow(QMainWindow):
         self._set_device_status("offline", "● 设备离线")
         self.device_label.setText(self.SOURCE_NAMES[self.config.source])
         self.settings_panel.set_connected(False)
+        self.source_switcher.setEnabled(True)
         self.settings_panel.finish_calibration()
         self.camera_view.set_record_enabled(False)
         self.camera_view.set_recording(False, 0)
@@ -726,6 +789,7 @@ class MainWindow(QMainWindow):
         self._last_samples.clear()
         self._last_video_shape = None
         self._tag_tones.clear()
+        self._tag_reference_positions.clear()
         for history in self._tag_histories.values():
             history.clear()
         self.fps_card.set_value("0 FPS")
@@ -768,6 +832,11 @@ class MainWindow(QMainWindow):
             #appTitle { color: #003A99; font-size: 18px; font-weight: 700; }
             #headerSeparator { background: #D9E0E8; }
             #deviceLabel { color: #0B121B; font-size: 13px; font-weight: 500; }
+            #sourceSwitcher {
+                min-width: 150px; max-height: 36px; padding: 0 10px;
+                font-size: 13px; font-weight: 600; color: #003A99;
+            }
+            #sourceSwitcher:disabled { color: #98A2B3; background: #F2F4F7; }
             #clockLabel { color: #3F4D5A; font-family: "Helvetica Neue"; font-size: 12px; }
             #deviceStatus { color: #5C6A78; font-size: 12px; font-weight: 500; }
             #deviceStatus[state="online"] { color: #12B76A; }
@@ -819,6 +888,8 @@ class MainWindow(QMainWindow):
             #tagCoordinates { color: #0B121B; font-size: 14px; font-weight: 500; }
             #tagOffset { color: #0B121B; font-size: 12px; font-weight: 500; }
             #tagStatus { background: #EEF2F7; color: #12B76A; border-radius: 10px; padding: 4px 8px; font-size: 12px; font-weight: 500; }
+            #tagThresholdSpin { min-height: 24px; max-height: 26px; min-width: 96px; padding: 0 4px; font-size: 12px; }
+            #tagThresholdSpin::up-button, #tagThresholdSpin::down-button { width: 18px; }
             #tagAction { background: #E5484D; color: #FFFFFF; border: 0; border-radius: 8px; font-size: 14px; }
             #tagMonitorCard[tone="proximity"] #tagOffset,
             #tagMonitorCard[tone="proximity"] #tagStatus { color: #FFB020; }

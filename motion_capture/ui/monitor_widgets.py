@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -8,6 +8,7 @@ import numpy as np
 from PyQt5.QtCore import QPointF, QRectF, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QFontDatabase, QIcon, QImage, QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import (
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -260,6 +261,7 @@ class CameraView(QFrame):
 class TagMonitorCard(QFrame):
     monitor_toggled = pyqtSignal(int, bool)
     settings_requested = pyqtSignal(int)
+    threshold_changed = pyqtSignal(int, float)
 
     def __init__(self, profile: TagMonitorProfile, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -284,12 +286,22 @@ class TagMonitorCard(QFrame):
         header.setSpacing(8)
         self.id_label = QLabel(f"ID {profile.tag_id:02d}")
         self.id_label.setObjectName("tagId")
-        self.config_label = QLabel(
-            f"{profile.tag_size_mm:g} × {profile.tag_size_mm:g} mm   阈值 {profile.quality_threshold:.2f}"
-        )
+        self.config_label = QLabel(f"{profile.tag_size_mm:g} × {profile.tag_size_mm:g} mm")
         self.config_label.setObjectName("tagConfig")
         header.addWidget(self.id_label)
         header.addWidget(self.config_label)
+        self.threshold_spin = QDoubleSpinBox()
+        self.threshold_spin.setObjectName("tagThresholdSpin")
+        self.threshold_spin.setRange(0.0, float("inf"))
+        self.threshold_spin.setDecimals(2)
+        self.threshold_spin.setSingleStep(0.01)
+        self.threshold_spin.setPrefix("阈值 ")
+        self.threshold_spin.setSuffix(" mm")
+        self.threshold_spin.setFixedWidth(148)
+        self.threshold_spin.setAlignment(Qt.AlignRight)
+        self.threshold_spin.setValue(profile.quality_threshold)
+        self.threshold_spin.valueChanged.connect(self._threshold_value_changed)
+        header.addWidget(self.threshold_spin)
         header.addStretch()
         data_layout.addLayout(header)
         self.coordinates_label = QLabel("X —  ·  Y —  ·  Z —")
@@ -382,11 +394,18 @@ class TagMonitorCard(QFrame):
             return
         x, y, z = position
         self.coordinates_label.setText(f"X {x:+.1f}  ·  Y {y:+.1f}  ·  Z {z:+.1f}")
-        if offset_mm is not None and variance_mm is not None:
+        if offset_mm is None or variance_mm is None:
+            self.offset_label.setText("偏移量：— mm ± —")
+        else:
             self.offset_label.setText(f"偏移量：{offset_mm:.1f} mm ± {variance_mm:.2f}")
+
+    def _threshold_value_changed(self, value: float) -> None:
+        self.profile = replace(self.profile, quality_threshold=value)
+        self.threshold_changed.emit(self.profile.tag_id, value)
 
     def set_profile(self, profile: TagMonitorProfile) -> None:
         self.profile = profile
-        self.config_label.setText(
-            f"{profile.tag_size_mm:g} × {profile.tag_size_mm:g} mm   阈值 {profile.quality_threshold:.2f}"
-        )
+        self.config_label.setText(f"{profile.tag_size_mm:g} × {profile.tag_size_mm:g} mm")
+        self.threshold_spin.blockSignals(True)
+        self.threshold_spin.setValue(profile.quality_threshold)
+        self.threshold_spin.blockSignals(False)
