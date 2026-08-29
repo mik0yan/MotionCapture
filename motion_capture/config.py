@@ -134,9 +134,9 @@ def build_realsense_config(
 ) -> RealSenseConfig:
     """Validate RealSense stream, AprilTag board, and zero-reference settings."""
     normalized_family = tag_family.strip().lower().replace("_", "")
-    supported_families = {"tag36h11", "tag25h9", "tag16h5", "tagcircle21h7"}
+    supported_families = {"tag36h11", "tag25h9", "tag16h5"}
     if normalized_family not in supported_families:
-        raise ValueError("AprilTag family 仅支持 tag36h11、tag25h9、tag16h5 或 tagCircle21h7")
+        raise ValueError("AprilTag family 仅支持 tag36h11、tag25h9 或 tag16h5")
     if not 320 <= int(width) <= 4096 or not 240 <= int(height) <= 2160:
         raise ValueError("RealSense 分辨率必须在 320×240 到 4096×2160 范围内")
     if not 1 <= int(fps) <= 120:

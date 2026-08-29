@@ -86,7 +86,7 @@ class RealSenseConfigForm(QFrame):
 
         fields.addWidget(QLabel("Tag Family"), 0, 6)
         self.family_combo = QComboBox()
-        for family in ("tag36h11", "tag25h9", "tag16h5", "tagCircle21h7"):
+        for family in ("tag36h11", "tag25h9", "tag16h5"):
             self.family_combo.addItem(family, family.lower())
         fields.addWidget(self.family_combo, 0, 7)
 

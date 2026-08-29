@@ -144,7 +144,7 @@ class SettingsPanel(QFrame):
         self.fps_spin.setSuffix(" FPS")
         form.addRow("帧率", self.fps_spin)
         self.family_combo = QComboBox()
-        for family in ("tag36h11", "tag25h9", "tag16h5", "tagCircle21h7"):
+        for family in ("tag36h11", "tag25h9", "tag16h5"):
             self.family_combo.addItem(family, family.lower())
         form.addRow("Tag Family", self.family_combo)
         self.ids_edit = QLineEdit()

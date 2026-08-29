@@ -19,7 +19,6 @@ ARUCO_DICTIONARIES = {
     "tag36h11": "DICT_APRILTAG_36h11",
     "tag25h9": "DICT_APRILTAG_25h9",
     "tag16h5": "DICT_APRILTAG_16h5",
-    "tagcircle21h7": "DICT_APRILTAG_21h7",
 }
 
 

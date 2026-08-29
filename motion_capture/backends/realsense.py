@@ -37,7 +37,6 @@ class RealSenseAprilTagBackend(TrackerBackend):
             "tag36h11": cv2.aruco.DICT_APRILTAG_36h11,
             "tag25h9": cv2.aruco.DICT_APRILTAG_25h9,
             "tag16h5": cv2.aruco.DICT_APRILTAG_16h5,
-            "tagcircle21h7": cv2.aruco.DICT_APRILTAG_21h7,
         }
         if dictionary_name not in dictionaries:
             raise ValueError(f"不支持的 AprilTag family: {self.config.tag_family}")
