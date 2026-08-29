@@ -1,0 +1,6 @@
+PyQt5>=5.15.10,<5.16
+numpy>=1.26,<2
+opencv-contrib-python>=4.9,<5
+python-dotenv>=1.0,<2
+open3d>=0.19,<0.20
+openpyxl>=3.1,<4

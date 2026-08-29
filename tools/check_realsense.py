@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+INTEL_VENDOR_ID = 0x8086
+
+USB_SPEEDS = {
+    0: "Low Speed (1.5 Mb/s)",
+    1: "Full Speed (12 Mb/s, USB 1.1)",
+    2: "High Speed (480 Mb/s, USB 2.0)",
+    3: "SuperSpeed (5 Gb/s, USB 3.0)",
+    4: "SuperSpeed+ (10 Gb/s, USB 3.1)",
+    5: "SuperSpeed+ (20 Gb/s, USB 3.2)",
+}
+
+
+@dataclass(frozen=True)
+class UsbDevice:
+    name: str
+    serial: str
+    vendor_id: int
+    product_id: int
+    speed: int | None
+    location_id: int
+    hub_chain: tuple[str, ...]
+
+    @property
+    def speed_label(self) -> str:
+        if self.speed is None:
+            return "未知"
+        return USB_SPEEDS.get(self.speed, f"未知速率码 {self.speed}")
+
+    @property
+    def is_usb3(self) -> bool:
+        return self.speed is not None and self.speed >= 3
+
+    @property
+    def avfoundation_uid(self) -> str:
+        """AVFoundation 给 UVC 设备的 uniqueID 是 locationID + VID + PID 的拼接。"""
+        return f"{self.location_id:x}{self.vendor_id:04x}{self.product_id:04x}"
+
+
+@dataclass(frozen=True)
+class CaptureDevice:
+    index: int
+    name: str
+    unique_id: str
+
+
+def _run(command: list[str]) -> bytes:
+    result = subprocess.run(command, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"{' '.join(command)} 执行失败: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def usb_devices() -> tuple[UsbDevice, ...]:
+    tree = plistlib.loads(_run(["ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l", "-w0"]))
+    found: dict[int, UsbDevice] = {}
+
+    def walk(nodes: list[dict], hubs: tuple[str, ...]) -> None:
+        for node in nodes:
+            name = str(node.get("USB Product Name", "")).strip()
+            vendor_id = node.get("idVendor")
+            location_id = node.get("locationID")
+            is_device = isinstance(vendor_id, int) and isinstance(location_id, int)
+            if is_device and location_id not in found and node.get("Device Speed") is not None:
+                found[location_id] = UsbDevice(
+                    name=name or "(未命名设备)",
+                    serial=str(node.get("USB Serial Number", "")).strip(),
+                    vendor_id=vendor_id,
+                    product_id=int(node.get("idProduct", 0)),
+                    speed=node.get("Device Speed"),
+                    location_id=location_id,
+                    hub_chain=hubs,
+                )
+            children = node.get("IORegistryEntryChildren", [])
+            child_hubs = hubs + (name,) if is_device and "hub" in name.lower() else hubs
+            walk(children, child_hubs)
+
+    walk(tree, ())
+    return tuple(found.values())
+
+
+def realsense_usb_devices() -> tuple[UsbDevice, ...]:
+    return tuple(
+        device
+        for device in usb_devices()
+        if device.vendor_id == INTEL_VENDOR_ID and "realsense" in device.name.lower()
+    )
+
+
+def _system_profiler_cameras() -> tuple[str, ...]:
+    payload = json.loads(_run(["system_profiler", "-json", "SPCameraDataType"]))
+    return tuple(str(item.get("_name", "")).strip() for item in payload.get("SPCameraDataType", []))
+
+
+def capture_devices() -> tuple[CaptureDevice, ...]:
+    """按 OpenCV AVFoundation 后端使用的顺序枚举摄像头。
+
+    cap_avfoundation_mac.mm 取的是 devicesWithMediaType(Video) 拼接
+    devicesWithMediaType(Muxed)，因此这里的下标即 VideoCapture 的索引。
+    system_profiler 的顺序不稳定，只在没有 pyobjc 时兜底。
+    """
+    try:
+        import AVFoundation as AVF
+    except ImportError:
+        return tuple(CaptureDevice(index, name, "") for index, name in enumerate(_system_profiler_cameras()))
+
+    video = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeVideo) or []
+    muxed = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeMuxed) or []
+    return tuple(
+        CaptureDevice(index, str(device.localizedName()), str(device.uniqueID()))
+        for index, device in enumerate(list(video) + list(muxed))
+    )
+
+
+def realsense_capture_device() -> CaptureDevice | None:
+    """定位 RealSense 的彩色流索引，优先用 USB locationID/VID/PID 交叉验证。"""
+    devices = capture_devices()
+    usb = realsense_usb_devices()
+    for device in devices:
+        uid = device.unique_id.lower().removeprefix("0x")
+        if any(uid == camera.avfoundation_uid for camera in usb):
+            return device
+    for device in devices:
+        if "realsense" in device.name.lower():
+            return device
+    return None
+
+
+def pyrealsense_report() -> list[str]:
+    try:
+        import pyrealsense2 as rs
+    except ImportError as exc:
+        return [f"pyrealsense2 未安装 ({exc})"]
+
+    lines = [f"pyrealsense2 {getattr(rs, '__version__', '?')} 已安装 ({rs.__file__})"]
+    try:
+        devices = rs.context().query_devices()
+    except Exception as exc:
+        lines.append(f"查询设备失败: {type(exc).__name__}: {exc}")
+        return lines
+
+    count = len(devices)
+    lines.append(f"SDK 枚举到 {count} 个设备")
+    if count == 0:
+        return lines
+
+    # macOS 12+ 下不带 sudo 时，取设备句柄就会抛 "failed to set power state"。
+    try:
+        for device in devices:
+            def info(key) -> str:
+                try:
+                    return device.get_info(key)
+                except Exception:
+                    return "?"
+
+            lines.append(
+                f"{info(rs.camera_info.name)} | SN {info(rs.camera_info.serial_number)} "
+                f"| 固件 {info(rs.camera_info.firmware_version)} | USB {info(rs.camera_info.usb_type_descriptor)}"
+            )
+    except Exception as exc:
+        lines.append(f"读取设备信息失败: {type(exc).__name__}: {exc}")
+        if "power state" in str(exc).lower() or os.geteuid() != 0:
+            lines.append("原因: macOS 12+ 的 USB 安全策略要求 librealsense 以 root 访问设备。")
+            lines.append("用 sudo 重跑本脚本即可读到设备信息，例如:")
+            lines.append("  sudo .venv/bin/python tools/check_realsense.py")
+    return lines
+
+
+def probe_opencv(indices: list[int]) -> bool:
+    """逐个试开摄像头并即时打印。单次打开可能耗时数秒，因此不缓冲输出。"""
+    try:
+        import cv2
+    except ImportError as exc:
+        print(f"  opencv 未安装 ({exc})", flush=True)
+        return False
+
+    names = {device.index: device.name for device in capture_devices()}
+    any_frame = False
+    for index in indices:
+        print(f"  索引 {index} ({names.get(index, '?')}) 试打开...", end=" ", flush=True)
+        started = time.monotonic()
+        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        if not capture.isOpened():
+            capture.release()
+            print(f"失败 ({time.monotonic() - started:.1f}s)", flush=True)
+            continue
+        ok, frame = capture.read()
+        elapsed = time.monotonic() - started
+        if ok and frame is not None:
+            any_frame = True
+            print(f"成功, 首帧 {frame.shape[1]}x{frame.shape[0]} ({elapsed:.1f}s)", flush=True)
+        else:
+            print(f"已打开但读不到帧 ({elapsed:.1f}s)", flush=True)
+        capture.release()
+    return any_frame
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="检查 RealSense 的 USB 连接与可读性")
+    parser.add_argument("--probe", action="store_true", help="用 OpenCV 实际打开摄像头读一帧（会触发系统摄像头权限）")
+    parser.add_argument("--index", type=int, default=None, help="只探测指定索引，默认自动定位 RealSense")
+    parser.add_argument("--all", action="store_true", help="配合 --probe 探测全部索引")
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    print("=== USB 连接 ===")
+    cameras = realsense_usb_devices()
+    if not cameras:
+        print("未在 USB 总线上找到 RealSense 相机。检查线缆与供电，确认使用数据线而非充电线。")
+    for device in cameras:
+        print(f"设备: {device.name}")
+        print(f"  序列号: {device.serial or '(无)'}")
+        print(f"  VID:PID: 0x{device.vendor_id:04X}:0x{device.product_id:04X}")
+        print(f"  链路速率: {device.speed_label}")
+        print(f"  接入路径: {' -> '.join(device.hub_chain) if device.hub_chain else '直连主机端口'}")
+        if not device.is_usb3:
+            print("  警告: 以 USB 2.0 及以下速率握手，深度+彩色高分辨率同步会受限。改用 USB 3 端口与线缆。")
+        if device.hub_chain:
+            print("  提示: 经由 Hub 连接，带宽不足时优先改为直连主机端口。")
+
+    print()
+    print("=== pyrealsense2 (深度/红外/对齐所需) ===")
+    for line in pyrealsense_report():
+        print(f"  {line}")
+
+    print()
+    print("=== 摄像头索引 (OpenCV VideoCapture 顺序) ===")
+    target = realsense_capture_device()
+    for device in capture_devices():
+        marker = "  <- RealSense 彩色流" if target is not None and device.index == target.index else ""
+        print(f"  索引 {device.index}: {device.name}{marker}")
+    if target is None:
+        print("  未能定位 RealSense 的彩色流")
+
+    if args.probe:
+        print()
+        print("=== OpenCV 读取测试 ===")
+        if args.index is not None:
+            indices = [args.index]
+        elif args.all:
+            indices = [device.index for device in capture_devices()]
+        elif target is not None:
+            indices = [target.index]
+        else:
+            indices = [device.index for device in capture_devices()]
+        if not probe_opencv(indices):
+            print("  没读到画面。若上方出现 not authorized，需在 系统设置 → 隐私与安全性 → 摄像头 授权当前终端，并 ⌘Q 完全退出后重开。")
+
+    return 0 if cameras else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

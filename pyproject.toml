@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motion-capture"
+version = "0.1.0"
+description = "PyQt5 motion capture UI for RealSense AprilTag boards and NDI ROM tools"
+requires-python = ">=3.10"
+dependencies = [
+  "PyQt5>=5.15.10,<5.16",
+  "numpy>=1.26,<2",
+  "opencv-contrib-python>=4.9,<5",
+  "python-dotenv>=1.0,<2",
+  "open3d>=0.19,<0.20",
+  "openpyxl>=3.1,<4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_default_fixture_loop_scope = "function"
