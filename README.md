@@ -4,7 +4,8 @@
 
 - Intel RealSense 彩色流 + AprilTag 网格标定板位姿；
 - NDI Polaris Vega / Polaris Vicra、Spectra + ROM 红外反光球工具；
-- 无硬件模拟器、实时位姿表、Open3D 三维空间轨迹和 CSV 录制。
+- 无硬件模拟器、AprilTag 独立监控、Open3D 三维空间轨迹和 CSV/XLSX 录制；
+- 本地 SQLite 持久化设备设置、Tag 监控参数、采集会话和逐帧位姿样本。
 
 > 当前版本是科研/工程采集工具，不是已验证的医疗器械软件。进入测量或临床验证前，需要完成坐标系、精度、丢帧、时间同步和设备异常的独立确认。
 
@@ -22,13 +23,30 @@ python main.py
 
 默认 `.env` 使用 `MOCAP_SOURCE=simulator`，可在没有硬件时直接验收界面、轨迹和录制功能。
 
-主界面顶部提供三段式“工作模式”状态切换器：`NDI 模式`、`RealSense`、`模拟器模式`。选中按钮使用青绿色状态，切换时自动显示对应设备配置表单并更新根目录 `.env` 的 `MOCAP_SOURCE`；设备连接期间切换器会锁定，断开后恢复。
+主界面按 Figma `01 · RealSense 实时监控 · 监控功能` 重构：左侧为 1280×720 监控画面、RGB/D/Tag 图层开关、录制计时和实时指标，右侧为独立 AprilTag 监控卡及设置页。设置页可切换 `RealSense（USB）`、`NDI（IP/串口）` 和 `模拟器`，连接期间会锁定配置。
 
-Open3D 0.19 由基础依赖安装。三维面板通过隐藏的 GLFW 渲染上下文生成画面并嵌入 PyQt5，不会显示额外的 Open3D 窗口。
+每张 AprilTag 卡片直接显示 XYZ、相机距离偏移量和最近 5 秒位置方差；长按卡片至少 500 ms 可单独修改该 ID 的实际尺寸与质量阈值。运行中修改尺寸会立即用于该 Tag 的后续 PnP 解算，并持久化到本地 SQLite。
+
+Open3D 0.19 由基础依赖安装；在“设置”页点击“打开 Open3D 三维轨迹”进入独立窗口。三维面板通过隐藏的 GLFW 渲染上下文生成画面并嵌入 PyQt5。
 
 ## 配置
 
 实际配置保存在根目录 `.env`，该文件已加入 `.gitignore`；可提交的模板是 `.env.example`。手工修改 `.env` 后重启应用。
+
+### 本地 SQLite 数据库
+
+首次启动会自动创建 `data/motion_capture.sqlite3`。应用会把 `.env` 作为首次启动/部署默认值导入 SQLite，之后界面保存的运行配置以 SQLite 为准，同时回写 `.env` 以兼容现有硬件脚本。
+
+```dotenv
+MOCAP_DATABASE_PATH=data/motion_capture.sqlite3
+```
+
+数据库包含：
+
+- `app_settings`：当前运行配置；
+- `tag_monitors`：Tag 尺寸、质量阈值、警戒距离和启停状态；
+- `capture_sessions`：每次设备连接形成的采集会话；
+- `pose_samples`：会话内 XYZ、姿态、质量与硬件帧号。
 
 ### Open3D 三维实时显示
 
@@ -53,7 +71,7 @@ OPEN3D_CAMERA_FOV_DEG=60
 
 ### RealSense + AprilTag 标定板
 
-在主界面选择“Intel RealSense / AprilTag”后，会显示 RealSense 配置与初始标定表单，可设置设备序列号、彩色流分辨率/FPS、Tag family、ID 顺序、标定板行列、Tag 实际边长、间距、最少可见 Tag 数和位置导出格式。点击“保存配置”或“连接设备”都会把当前表单写入根目录 `.env`。
+在“设置”页选择“Intel RealSense（USB 设备）”后，可设置设备序列号、彩色流分辨率/FPS、Tag family、ID 顺序、标定板行列、Tag 实际边长、间距、最少可见 Tag 数和位置导出格式。点击“保存设置”或“连接设备”都会把当前配置写入本地 SQLite，并同步根目录 `.env`。
 
 ```dotenv
 MOCAP_SOURCE=realsense
@@ -65,7 +83,7 @@ APRILTAG_FAMILY=tag36h11
 APRILTAG_IDS=0,1,2,3
 APRILTAG_BOARD_ROWS=2
 APRILTAG_BOARD_COLS=2
-APRILTAG_SIZE_M=0.080
+APRILTAG_SIZE_M=0.024
 APRILTAG_SPACING_M=0.020
 APRILTAG_MIN_VISIBLE_TAGS=1
 REALSENSE_RECORD_FORMAT=xlsx

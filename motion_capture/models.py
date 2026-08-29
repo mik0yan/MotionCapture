@@ -65,6 +65,15 @@ class PoseSample:
 
 
 @dataclass(frozen=True)
+class TagDetection:
+    tag_id: int
+    corners_px: tuple[tuple[float, float], ...]
+    distance_mm: float
+    quality: float | None = None
+
+
+@dataclass(frozen=True)
 class TrackingPacket:
     samples: tuple[PoseSample, ...]
     image_rgb: np.ndarray | None = field(default=None, repr=False)
+    tag_detections: tuple[TagDetection, ...] = ()

@@ -3,281 +3,281 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
 
 import numpy as np
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QFont, QImage, QPixmap
+from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import (
-    QAbstractItemView,
     QFrame,
-    QHeaderView,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
-    QPushButton,
-    QSizePolicy,
-    QSplitter,
-    QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from motion_capture.calibration import apply_reference_pose, average_initial_pose, is_identity_reference
+from motion_capture.calibration import apply_reference_pose, average_initial_pose
 from motion_capture.config import AppConfig, save_ndi_config, save_realsense_config, save_source_mode
 from motion_capture.models import PoseSample, TrackingPacket
 from motion_capture.recorder import TrajectoryRecorder
-from motion_capture.ui.ndi_config_form import NDIConfigForm
-from motion_capture.ui.mode_switcher import WorkModeSwitcher
+from motion_capture.storage import AppDatabase, TagMonitorProfile
+from motion_capture.ui.monitor_widgets import CameraView, MetricCard, TagMonitorCard, app_font
 from motion_capture.ui.open3d_view import Open3DViewWidget
-from motion_capture.ui.realsense_config_form import RealSenseConfigForm
+from motion_capture.ui.settings_panel import SettingsPanel
 from motion_capture.worker import TrackingWorker
 
 
-class MetricCard(QFrame):
-    def __init__(self, title: str, value: str) -> None:
-        super().__init__()
-        self.setObjectName("metricCard")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        title_label = QLabel(title)
-        title_label.setObjectName("metricTitle")
-        self.value_label = QLabel(value)
-        self.value_label.setObjectName("metricValue")
-        layout.addWidget(title_label)
-        layout.addWidget(self.value_label)
-
-    def set_value(self, value: str) -> None:
-        self.value_label.setText(value)
-
-
 class MainWindow(QMainWindow):
-    SOURCE_LABELS = {
-        "模拟器（无需硬件）": "simulator",
-        "Intel RealSense / AprilTag": "realsense",
-        "NDI / ROM 反光球工具": "ndi",
-    }
-    SOURCE_DISPLAY_NAMES = {
-        "ndi": "NDI 模式",
-        "realsense": "RealSense",
-        "simulator": "模拟器模式",
+    SOURCE_NAMES = {
+        "realsense": "Intel RealSense D435i · USB 3.2",
+        "ndi": "NDI 光学定位 · IP / ROM",
+        "simulator": "模拟数据源 · 本地验证",
     }
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, database: AppDatabase | None = None) -> None:
         super().__init__()
         self.config = config
+        self.database = database or AppDatabase(config.database_path)
         self.worker: TrackingWorker | None = None
         self.recorder = TrajectoryRecorder(config.record_dir)
-        self._frame_times: deque[float] = deque(maxlen=60)
+        self._session_id: int | None = None
+        self._session_device_name = ""
+        self._session_failed = False
+        self._last_export_path: Path | None = None
+        self._frame_times: deque[float] = deque(maxlen=90)
+        self._last_packet_at: float | None = None
         self._last_samples: dict[str, PoseSample] = {}
+        self._tag_cards: dict[int, TagMonitorCard] = {}
+        self._tag_profiles: dict[int, TagMonitorProfile] = {}
+        self._tag_histories: dict[int, deque[tuple[float, np.ndarray]]] = {}
+        self._tag_tones: dict[int, str] = {}
         self._rs_calibration_samples: list[PoseSample] | None = None
         self._rs_calibration_frames: set[int] = set()
-        self.setWindowTitle("MotionCapture · RealSense / NDI")
-        self.resize(1360, 920)
+        self._record_started_at: float | None = None
+        self.spatial_dialog: QDialog | None = None
+        self.spatial_view: Open3DViewWidget | None = None
+        self._closed = False
+
+        self.setWindowTitle("姿态捕捉系统")
+        self.resize(1440, 1024)
+        self.setMinimumSize(1120, 760)
         self._build_ui()
         self._apply_style()
+        self._reload_tag_cards()
+        self._sync_source_ui()
+
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(1000)
+        self._ui_timer.timeout.connect(self._update_clock_and_recording)
+        self._ui_timer.start()
+        self._update_clock_and_recording()
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("appRoot")
         root = QVBoxLayout(central)
-        root.setContentsMargins(22, 18, 22, 18)
-        root.setSpacing(16)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        title = QLabel("MotionCapture")
-        title.setObjectName("pageTitle")
-        subtitle = QLabel("RealSense AprilTag 标定板 · NDI 红外反光球 ROM 工具")
-        subtitle.setObjectName("subtitle")
-        titles.addWidget(title)
-        titles.addWidget(subtitle)
-        header.addLayout(titles)
-        header.addStretch()
-        self.status_badge = QLabel("● 未连接")
-        self.status_badge.setObjectName("statusBadge")
-        header.addWidget(self.status_badge)
-        root.addLayout(header)
+        header = QFrame()
+        header.setObjectName("appHeader")
+        header.setFixedHeight(64)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(24, 0, 24, 0)
+        header_layout.setSpacing(16)
+        title = QLabel("姿态捕捉系统")
+        title.setObjectName("appTitle")
+        header_layout.addWidget(title)
+        separator = QFrame()
+        separator.setObjectName("headerSeparator")
+        separator.setFixedSize(1, 24)
+        header_layout.addWidget(separator)
+        self.device_label = QLabel()
+        self.device_label.setObjectName("deviceLabel")
+        header_layout.addWidget(self.device_label, 1)
+        self.device_status = QLabel("● 设备离线")
+        self.device_status.setObjectName("deviceStatus")
+        self.device_status.setProperty("state", "offline")
+        header_layout.addWidget(self.device_status)
+        self.clock_label = QLabel()
+        self.clock_label.setObjectName("clockLabel")
+        header_layout.addWidget(self.clock_label)
+        root.addWidget(header)
 
-        controls = QFrame()
-        controls.setObjectName("controlBar")
-        control_layout = QHBoxLayout(controls)
-        control_layout.setContentsMargins(16, 12, 16, 12)
-        control_layout.addWidget(QLabel("工作模式"))
-        self.mode_switcher = WorkModeSwitcher(self.config.source)
-        control_layout.addWidget(self.mode_switcher, 1)
-        self.connect_button = QPushButton("连接设备")
-        self.connect_button.setObjectName("primaryButton")
-        self.connect_button.clicked.connect(self.toggle_connection)
-        control_layout.addWidget(self.connect_button)
-        self.record_button = QPushButton(self._idle_record_button_text())
-        self.record_button.setEnabled(False)
-        self.record_button.clicked.connect(self.toggle_recording)
-        control_layout.addWidget(self.record_button)
-        root.addWidget(controls)
+        workspace = QFrame()
+        workspace.setObjectName("workspace")
+        workspace_layout = QHBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(0)
 
-        self.realsense_form = RealSenseConfigForm(self.config.realsense)
-        self.realsense_form.save_requested.connect(self._save_realsense_form)
-        self.realsense_form.calibration_requested.connect(self._toggle_realsense_calibration)
-        self.realsense_form.clear_calibration_requested.connect(self._clear_realsense_calibration)
+        main_view = QFrame()
+        main_view.setObjectName("mainView")
+        main_layout = QVBoxLayout(main_view)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        asset_root = Path(__file__).resolve().parent / "assets"
+        self.camera_view = CameraView(asset_root)
+        self.camera_view.record_requested.connect(self.toggle_recording)
+        main_layout.addWidget(self.camera_view, 1)
 
-        self.ndi_form = NDIConfigForm(self.config.root, self.config.ndi)
-        self.ndi_form.save_requested.connect(self._save_ndi_form)
-        self.device_config_stack = QStackedWidget()
-        self.device_config_stack.setObjectName("deviceConfigStack")
-        self.device_config_stack.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        self.device_config_stack.addWidget(self.realsense_form)
-        self.device_config_stack.addWidget(self.ndi_form)
-        root.addWidget(self.device_config_stack)
-        self.mode_switcher.mode_changed.connect(self._on_mode_changed)
-        self._sync_source_panels()
+        metric_bar = QFrame()
+        metric_bar.setObjectName("metricBar")
+        metric_bar.setFixedHeight(84)
+        metric_layout = QHBoxLayout(metric_bar)
+        metric_layout.setContentsMargins(16, 8, 16, 8)
+        metric_layout.setSpacing(12)
+        self.resolution_card = MetricCard("分辨率", "1280 × 720")
+        self.fps_card = MetricCard("帧率", "0 FPS")
+        self.latency_card = MetricCard("响应时间", "— ms")
+        self.roll_pitch_card = MetricCard("IMU · Roll / Pitch", "—° / —°")
+        self.yaw_card = MetricCard("IMU · Yaw", "—°")
+        for card in (
+            self.resolution_card,
+            self.fps_card,
+            self.latency_card,
+            self.roll_pitch_card,
+            self.yaw_card,
+        ):
+            metric_layout.addWidget(card)
+        main_layout.addWidget(metric_bar)
+        workspace_layout.addWidget(main_view, 1)
 
-        metrics = QHBoxLayout()
-        self.source_card = MetricCard(
-            "当前数据源", f"{self.SOURCE_DISPLAY_NAMES[self.config.source]} · 待连接"
-        )
-        self.tools_card = MetricCard("可见工具", "0")
-        self.fps_card = MetricCard("更新频率", "0.0 Hz")
-        self.frame_card = MetricCard("最新帧号", "—")
-        for card in (self.source_card, self.tools_card, self.fps_card, self.frame_card):
-            metrics.addWidget(card)
-        root.addLayout(metrics)
+        sidebar = QFrame()
+        sidebar.setObjectName("rightSidebar")
+        sidebar.setFixedWidth(400)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(16, 16, 16, 16)
+        sidebar_layout.setSpacing(0)
+        self.sidebar_tabs = QTabWidget()
+        self.sidebar_tabs.setObjectName("sidebarTabs")
+        self.sidebar_tabs.setDocumentMode(True)
 
-        splitter = QSplitter(Qt.Horizontal)
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        self.video_label = QLabel("连接 RealSense 后显示视频\nNDI 模式显示位姿与轨迹")
-        self.video_label.setObjectName("videoPanel")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(660, 250)
-        left_layout.addWidget(self.video_label, 3)
-        self.spatial_view = Open3DViewWidget(self.config.open3d)
-        left_layout.addWidget(self.spatial_view, 2)
-        splitter.addWidget(left)
+        monitor_page = QWidget()
+        monitor_layout = QVBoxLayout(monitor_page)
+        monitor_layout.setContentsMargins(0, 12, 0, 0)
+        monitor_layout.setSpacing(0)
+        self.monitor_scroll = QScrollArea()
+        self.monitor_scroll.setObjectName("monitorScroll")
+        self.monitor_scroll.setWidgetResizable(True)
+        self.monitor_scroll.setFrameShape(QFrame.NoFrame)
+        self.monitor_content = QWidget()
+        self.monitor_cards_layout = QVBoxLayout(self.monitor_content)
+        self.monitor_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.monitor_cards_layout.setSpacing(12)
+        self.monitor_cards_layout.addStretch()
+        self.monitor_scroll.setWidget(self.monitor_content)
+        monitor_layout.addWidget(self.monitor_scroll)
 
-        right = QWidget()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(10, 0, 0, 0)
-        section = QLabel("实时位姿")
-        section.setObjectName("sectionTitle")
-        right_layout.addWidget(section)
-        self.table = QTableWidget(0, 9)
-        self.table.setHorizontalHeaderLabels(("工具", "状态", "X mm", "Y mm", "Z mm", "Rx °", "Ry °", "Rz °", "质量"))
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        right_layout.addWidget(self.table, 1)
+        settings_scroll = QScrollArea()
+        settings_scroll.setObjectName("settingsScroll")
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_host = QWidget()
+        settings_host_layout = QVBoxLayout(settings_host)
+        settings_host_layout.setContentsMargins(0, 12, 0, 0)
+        self.settings_panel = SettingsPanel(self.config)
+        self.settings_panel.source_changed.connect(self._on_source_changed)
+        self.settings_panel.save_requested.connect(self._save_settings)
+        self.settings_panel.connect_requested.connect(self.toggle_connection)
+        self.settings_panel.calibration_requested.connect(self._toggle_realsense_calibration)
+        self.settings_panel.clear_calibration_requested.connect(self._clear_realsense_calibration)
+        self.settings_panel.spatial_view_requested.connect(self._open_spatial_view)
+        settings_host_layout.addWidget(self.settings_panel)
+        settings_scroll.setWidget(settings_host)
 
-        config_title = QLabel("当前配置")
-        config_title.setObjectName("sectionTitle")
-        right_layout.addWidget(config_title)
-        self.config_label = QLabel(self._config_summary())
-        self.config_label.setObjectName("configPanel")
-        self.config_label.setWordWrap(True)
-        self.config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        right_layout.addWidget(self.config_label)
-        splitter.addWidget(right)
-        splitter.setSizes([850, 470])
-        root.addWidget(splitter, 1)
+        self.sidebar_tabs.addTab(monitor_page, "监控功能")
+        self.sidebar_tabs.addTab(settings_scroll, "设置")
+        sidebar_layout.addWidget(self.sidebar_tabs)
+        workspace_layout.addWidget(sidebar)
+        root.addWidget(workspace, 1)
         self.setCentralWidget(central)
+        self.statusBar().hide()
 
-    def _config_summary(self) -> str:
-        rs = self.config.realsense
-        ndi = self.config.ndi
-        roms = ", ".join(path.name for path in ndi.rom_files) or "未配置"
-        ndi_endpoint = (
-            f"{ndi.ip_address}:{ndi.port}"
-            if ndi.tracker_type == "vega"
-            else (ndi.serial_port or "自动检测串口")
-        )
-        return (
-            f"配置文件：{self.config.root / '.env'}\n"
-            f"工作模式：{self.SOURCE_DISPLAY_NAMES[self._selected_source()]}\n"
-            f"AprilTag：{rs.tag_family} · {rs.board_rows}×{rs.board_cols} · {rs.tag_size_m * 1000:.0f} mm\n"
-            f"RealSense 位置：{rs.record_format.upper()} · 最少 {rs.min_visible_tags} Tag\n"
-            f"RealSense 零点：{'已标定' if not is_identity_reference(rs.reference_transform) else '未标定'}\n"
-            f"NDI：{ndi.tracker_type.upper()} · {ndi_endpoint}\n"
-            f"ROM：{roms}\n"
-            f"NDI 轨迹：{ndi.record_format.upper()} · "
-            f"{'四元数' if ndi.record_orientation == 'quaternion' else '方向余弦矩阵'}\n"
-            f"Open3D：{'启用' if self.config.open3d.enabled else '禁用'} · {self.config.open3d.render_hz} Hz\n"
-            f"录制目录：{self.config.record_dir}"
-        )
+        self.record_button = self.camera_view.record_button
+        self.connect_button = self.settings_panel.connect_button
 
-    def _selected_source(self) -> str:
-        return self.mode_switcher.current_mode
-
-    def _on_mode_changed(self, mode: str) -> None:
-        self.config = replace(self.config, source=mode)
-        try:
-            env_path = save_source_mode(self.config.root, mode)
-        except OSError as exc:
-            QMessageBox.warning(self, "工作模式保存失败", str(exc))
+    def _update_clock_and_recording(self) -> None:
+        self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if self.recorder.active and self._record_started_at is not None:
+            elapsed = int(time.monotonic() - self._record_started_at)
+            self.camera_view.set_recording(True, elapsed)
         else:
-            self.statusBar().showMessage(f"工作模式已保存：{env_path}", 4000)
-        self._last_samples.clear()
-        self._frame_times.clear()
-        self.table.setRowCount(0)
-        self.spatial_view.clear()
-        self.video_label.clear()
-        self.video_label.setText("连接 RealSense 后显示视频\nNDI 模式显示位姿与轨迹")
-        self.source_card.set_value(f"{self.SOURCE_DISPLAY_NAMES[mode]} · 待连接")
-        self.tools_card.set_value("0")
-        self.fps_card.set_value("0.0 Hz")
-        self.frame_card.set_value("—")
-        self.record_button.setText(self._idle_record_button_text())
-        self.config_label.setText(self._config_summary())
-        self._sync_source_panels()
+            self.camera_view.set_recording(False, 0)
 
-    def _sync_source_panels(self) -> None:
-        source = self._selected_source()
-        if source == "realsense":
-            self.device_config_stack.setCurrentWidget(self.realsense_form)
-            self.device_config_stack.setVisible(True)
-        elif source == "ndi":
-            self.device_config_stack.setCurrentWidget(self.ndi_form)
-            self.device_config_stack.setVisible(True)
+    def _reload_tag_cards(self) -> None:
+        tag_ids = self.config.realsense.tag_ids
+        self.database.ensure_tag_monitors(tag_ids, self.config.realsense.tag_size_m * 1000.0)
+        profiles = self.database.list_tag_monitors(tag_ids)
+        self._tag_profiles = {profile.tag_id: profile for profile in profiles}
+        while self.monitor_cards_layout.count() > 1:
+            item = self.monitor_cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._tag_cards.clear()
+        for profile in profiles:
+            card = TagMonitorCard(profile)
+            card.monitor_toggled.connect(self._on_monitor_toggled)
+            card.settings_requested.connect(self._edit_tag_profile)
+            self.monitor_cards_layout.insertWidget(self.monitor_cards_layout.count() - 1, card)
+            self._tag_cards[profile.tag_id] = card
+            self._tag_histories.setdefault(profile.tag_id, deque())
+        if not profiles:
+            empty = QLabel("未配置 AprilTag ID")
+            empty.setObjectName("emptyState")
+            empty.setAlignment(Qt.AlignCenter)
+            self.monitor_cards_layout.insertWidget(0, empty)
+
+    def _sync_source_ui(self) -> None:
+        self.device_label.setText(self.SOURCE_NAMES[self.config.source])
+        self.settings_panel.load_config(self.config)
+        if self.config.source == "realsense":
+            self.resolution_card.set_value(
+                f"{self.config.realsense.width} × {self.config.realsense.height}"
+            )
+        elif self.config.source == "simulator":
+            self.resolution_card.set_value("1280 × 720")
         else:
-            self.device_config_stack.setVisible(False)
+            self.resolution_card.set_value("位置数据")
 
-    def _idle_record_button_text(self) -> str:
-        source = self._selected_source()
-        if source == "ndi":
-            return "开始轨迹记录"
-        if source == "realsense":
-            return "开始位置记录"
-        return "开始录制"
-
-    def _save_realsense_form(self, notify: bool = True) -> bool:
+    def _on_source_changed(self, source: str) -> None:
+        if source == self.config.source:
+            return
+        self.config = replace(self.config, source=source)
         try:
-            realsense = self.realsense_form.to_config()
-            env_path = save_realsense_config(self.config.root, realsense)
+            save_source_mode(self.config.root, source)
+            self.database.save_config(self.config)
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "RealSense 配置无效", str(exc))
-            return False
-        self.config = replace(self.config, realsense=realsense)
-        self.realsense_form.load_config(realsense)
-        self.config_label.setText(self._config_summary())
-        if notify:
-            self.statusBar().showMessage(f"RealSense 配置已保存：{env_path}", 6000)
-        return True
+            QMessageBox.warning(self, "数据源保存失败", str(exc))
+        self._reset_live_state()
+        self._sync_source_ui()
 
-    def _save_ndi_form(self, notify: bool = True) -> bool:
+    def _save_settings(self, notify: bool = True) -> bool:
         try:
-            ndi = self.ndi_form.to_config()
-            env_path = save_ndi_config(self.config.root, ndi)
+            updated = self.settings_panel.to_config(self.config)
+            save_source_mode(updated.root, updated.source)
+            save_realsense_config(updated.root, updated.realsense)
+            if updated.ndi.rom_files:
+                save_ndi_config(updated.root, updated.ndi)
+            self.database.save_config(updated)
         except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "NDI 配置无效", str(exc))
+            QMessageBox.warning(self, "设置无效", str(exc))
             return False
-        self.config = replace(self.config, ndi=ndi)
-        self.config_label.setText(self._config_summary())
+        self.config = updated
+        self.recorder.directory = updated.record_dir
+        self.settings_panel.load_config(updated)
+        self._reload_tag_cards()
+        self._sync_source_ui()
         if notify:
-            self.statusBar().showMessage(f"NDI 配置已保存：{env_path}", 6000)
+            QMessageBox.information(self, "设置已保存", f"本地 SQLite：{updated.database_path}")
         return True
 
     def toggle_connection(self) -> None:
@@ -287,21 +287,22 @@ class MainWindow(QMainWindow):
             self._connect()
 
     def _connect(self) -> None:
-        source = self._selected_source()
-        if source == "realsense" and not self._save_realsense_form(notify=False):
+        if not self._save_settings(notify=False):
             return
-        if source == "ndi" and not self._save_ndi_form(notify=False):
-            return
-        self._frame_times.clear()
-        self._last_samples.clear()
-        self.spatial_view.clear()
-        self.mode_switcher.setEnabled(False)
-        self.realsense_form.set_connection_active(True, calibration_available=False)
-        self.ndi_form.set_connection_active(True)
-        self.connect_button.setEnabled(False)
-        self.connect_button.setText("连接中…")
-        self.status_badge.setText("● 正在连接")
-        self.worker = TrackingWorker(self._selected_source(), self.config, self)
+        self._reset_live_state()
+        self.settings_panel.set_connecting()
+        self.camera_view.set_record_enabled(False)
+        self._set_device_status("connecting", "● 正在连接")
+        self._session_failed = False
+        tag_sizes_mm = {
+            tag_id: profile.tag_size_mm for tag_id, profile in self._tag_profiles.items()
+        }
+        self.worker = TrackingWorker(
+            self.config.source,
+            self.config,
+            self,
+            tag_sizes_mm=tag_sizes_mm,
+        )
         self.worker.connected.connect(self._on_connected)
         self.worker.packet_ready.connect(self._on_packet)
         self.worker.failed.connect(self._on_failed)
@@ -312,104 +313,199 @@ class MainWindow(QMainWindow):
         if self.recorder.active:
             self.toggle_recording()
         if self.worker is not None:
-            self.connect_button.setEnabled(False)
-            self.connect_button.setText("断开中…")
+            self.settings_panel.connect_button.setEnabled(False)
+            self.settings_panel.connect_button.setText("断开中…")
             self.worker.requestInterruption()
 
     def _on_connected(self, name: str) -> None:
-        self.status_badge.setText("● 已连接")
-        self.status_badge.setProperty("connected", True)
-        self.status_badge.style().unpolish(self.status_badge)
-        self.status_badge.style().polish(self.status_badge)
-        self.source_card.set_value(name)
-        self.connect_button.setText("断开设备")
-        self.connect_button.setEnabled(True)
-        self.record_button.setEnabled(True)
-        if self._selected_source() == "realsense":
-            self.realsense_form.set_connection_active(True, calibration_available=True)
+        self._session_device_name = name
+        self._session_id = self.database.start_session(self.config.source, name)
+        self._set_device_status("online", "● 设备在线")
+        self.device_label.setText(name)
+        self.settings_panel.set_connected(True)
+        self.camera_view.set_record_enabled(True)
 
     def _on_packet(self, packet: TrackingPacket) -> None:
-        if packet.samples and packet.samples[0].source == "realsense":
-            self._collect_realsense_calibration(packet.samples)
-            packet = TrackingPacket(
-                tuple(
-                    apply_reference_pose(sample, self.config.realsense.reference_transform)
-                    for sample in packet.samples
-                ),
-                packet.image_rgb,
+        raw_samples = packet.samples
+        if any(sample.source == "realsense" for sample in raw_samples):
+            self._collect_realsense_calibration(raw_samples)
+            samples = tuple(
+                apply_reference_pose(sample, self.config.realsense.reference_transform)
+                for sample in raw_samples
             )
+            packet = TrackingPacket(samples, packet.image_rgb, packet.tag_detections)
+
         now = time.monotonic()
         self._frame_times.append(now)
         if len(self._frame_times) > 1:
-            fps = (len(self._frame_times) - 1) / max(1e-6, self._frame_times[-1] - self._frame_times[0])
-            self.fps_card.set_value(f"{fps:.1f} Hz")
-        self.tools_card.set_value(str(len(packet.samples)))
-        if packet.samples:
-            self.frame_card.set_value(str(max(sample.frame_number for sample in packet.samples)))
-            for sample in packet.samples:
-                self._last_samples[sample.tool_id] = sample
-            self.spatial_view.add_samples(packet.samples)
-        self._update_table()
-        if packet.image_rgb is not None:
-            self._show_image(packet.image_rgb)
-        if self.recorder.active:
-            self.recorder.write(packet.samples)
-
-    def _show_image(self, image) -> None:
-        height, width, channels = image.shape
-        qimage = QImage(image.data, width, height, channels * width, QImage.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(qimage).scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.video_label.setPixmap(pixmap)
-
-    def _update_table(self) -> None:
-        samples = list(self._last_samples.values())
-        self.table.setRowCount(len(samples))
-        for row, sample in enumerate(samples):
-            euler = sample.euler_xyz_degrees
-            quality = "—" if sample.quality is None else f"{sample.quality:.3f}"
-            values = (
-                sample.tool_id, "有效" if sample.valid else "丢失",
-                *[f"{value:.2f}" for value in sample.position_mm],
-                *[f"{value:.2f}" for value in euler], quality,
+            fps = (len(self._frame_times) - 1) / max(
+                1e-6, self._frame_times[-1] - self._frame_times[0]
             )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column >= 2:
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.table.setItem(row, column, item)
+            self.fps_card.set_value(f"{fps:.0f} FPS")
+        if self._last_packet_at is not None:
+            self.latency_card.set_value(f"{(now - self._last_packet_at) * 1000.0:.0f} ms")
+        self._last_packet_at = now
+
+        for sample in packet.samples:
+            self._last_samples[sample.tool_id] = sample
+        if self.spatial_view is not None:
+            self.spatial_view.add_samples(packet.samples)
+        display_sample = next(
+            (sample for sample in packet.samples if sample.tool_id == "apriltag_board"),
+            packet.samples[0] if packet.samples else None,
+        )
+        if display_sample is not None:
+            roll, pitch, yaw = display_sample.euler_xyz_degrees
+            self.roll_pitch_card.set_value(f"{roll:.1f}° / {pitch:.1f}°")
+            self.yaw_card.set_value(f"{yaw:.1f}°")
+
+        self._update_tag_monitors(packet.samples, now)
+        self.camera_view.canvas.set_frame(packet.image_rgb, packet.tag_detections, self._tag_tones)
+        if self._session_id is not None:
+            self.database.record_samples(self._session_id, packet.samples)
+        if self.recorder.active:
+            if self.config.source in {"realsense", "simulator"}:
+                recorded = tuple(
+                    sample for sample in packet.samples if sample.tool_id == "apriltag_board"
+                )
+            else:
+                recorded = packet.samples
+            self.recorder.write(recorded)
+
+    def _update_tag_monitors(self, samples: tuple[PoseSample, ...], now: float) -> None:
+        by_tag: dict[int, PoseSample] = {}
+        for sample in samples:
+            if not sample.tool_id.startswith("tag_"):
+                continue
+            try:
+                tag_id = int(sample.tool_id.split("_", 1)[1])
+            except ValueError:
+                continue
+            by_tag[tag_id] = sample
+
+        for tag_id, card in self._tag_cards.items():
+            if not card.running:
+                card.set_state(False, "danger")
+                self._tag_tones[tag_id] = "danger"
+                continue
+            sample = by_tag.get(tag_id)
+            if sample is None:
+                card.update_values(None, None, None, "danger")
+                self._tag_tones[tag_id] = "danger"
+                continue
+            position = np.asarray(sample.position_mm, dtype=float)
+            history = self._tag_histories.setdefault(tag_id, deque())
+            history.append((now, position.copy()))
+            while history and now - history[0][0] > 5.0:
+                history.popleft()
+            variance_axis = np.var([item[1] for item in history], axis=0)
+            variance_mm = float(np.sqrt(np.mean(variance_axis)))
+            profile = self._tag_profiles[tag_id]
+            quality = 1.0 if sample.quality is None else sample.quality
+            camera_distance = float(np.linalg.norm(position))
+            if camera_distance <= profile.warning_distance_mm:
+                distance_tone = "danger"
+            elif camera_distance <= profile.warning_distance_mm * 1.5:
+                distance_tone = "proximity"
+            else:
+                distance_tone = "normal"
+            if not sample.valid or quality < profile.quality_threshold:
+                quality_tone = "danger"
+            elif quality < min(1.0, profile.quality_threshold + 0.1):
+                quality_tone = "proximity"
+            else:
+                quality_tone = "normal"
+            severity = {"normal": 0, "proximity": 1, "danger": 2}
+            tone = max((distance_tone, quality_tone), key=severity.__getitem__)
+            self._tag_tones[tag_id] = tone
+            card.update_values(sample.position_mm, camera_distance, variance_mm, tone)
+
+    def _on_monitor_toggled(self, tag_id: int, running: bool) -> None:
+        current = self._tag_profiles[tag_id]
+        updated = replace(current, enabled=running)
+        self.database.save_tag_monitor(updated)
+        self._tag_profiles[tag_id] = updated
+        if running:
+            self._tag_histories[tag_id] = deque()
+
+    def _edit_tag_profile(self, tag_id: int) -> None:
+        profile = self._tag_profiles[tag_id]
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"ID {tag_id:02d} 监控设置")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        form = QFormLayout()
+        form.setSpacing(10)
+        size_spin = QDoubleSpinBox()
+        size_spin.setRange(1.0, 1000.0)
+        size_spin.setDecimals(1)
+        size_spin.setSuffix(" mm")
+        size_spin.setValue(profile.tag_size_mm)
+        threshold_spin = QDoubleSpinBox()
+        threshold_spin.setRange(0.0, 1.0)
+        threshold_spin.setDecimals(2)
+        threshold_spin.setSingleStep(0.01)
+        threshold_spin.setValue(profile.quality_threshold)
+        form.addRow("Tag 尺寸", size_spin)
+        form.addRow("监控阈值", threshold_spin)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("保存")
+        buttons.button(QDialogButtonBox.Cancel).setText("取消")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+        updated = replace(
+            profile,
+            tag_size_mm=size_spin.value(),
+            quality_threshold=threshold_spin.value(),
+        )
+        self.database.save_tag_monitor(updated)
+        self._tag_profiles[tag_id] = updated
+        self._tag_cards[tag_id].set_profile(updated)
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.set_tag_size(tag_id, updated.tag_size_mm)
 
     def toggle_recording(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            return
         if self.recorder.active:
             path = self.recorder.stop()
-            self.record_button.setText(self._idle_record_button_text())
-            self.statusBar().showMessage(f"录制已保存：{path}", 8000)
+            self._last_export_path = path
+            self._record_started_at = None
+            self.camera_view.set_recording(False, 0)
+            if path is not None:
+                QMessageBox.information(self, "录制已保存", str(path))
+            return
+        if self.config.source == "ndi":
+            file_format = self.config.ndi.record_format
+            orientation = self.config.ndi.record_orientation
+        elif self.config.source == "realsense":
+            file_format = self.config.realsense.record_format
+            orientation = "position"
         else:
-            if self._selected_source() == "ndi":
-                file_format = self.config.ndi.record_format
-                orientation = self.config.ndi.record_orientation
-            elif self._selected_source() == "realsense":
-                file_format = self.config.realsense.record_format
-                orientation = "position"
-            else:
-                file_format = "csv"
-                orientation = "quaternion"
-            try:
-                self.recorder.configure(file_format, orientation)
-                path = self.recorder.start()
-            except (OSError, RuntimeError, ValueError) as exc:
-                QMessageBox.warning(self, "无法开始录制", str(exc))
-                return
-            self.record_button.setText("停止录制")
-            self.statusBar().showMessage(f"正在录制：{path}")
+            file_format = "csv"
+            orientation = "position"
+        try:
+            self.recorder.configure(file_format, orientation)
+            self.recorder.start()
+        except (OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self, "无法开始录制", str(exc))
+            return
+        self._record_started_at = time.monotonic()
+        self.camera_view.set_recording(True, 0)
 
     def _toggle_realsense_calibration(self) -> None:
         if self._rs_calibration_samples is not None:
             self._rs_calibration_samples = None
             self._rs_calibration_frames.clear()
-            self.realsense_form.finish_calibration("初始标定已取消")
-            self.record_button.setEnabled(True)
+            self.settings_panel.finish_calibration("初始标定已取消")
+            self.camera_view.set_record_enabled(True)
             return
-        if self.worker is None or not self.worker.isRunning() or self._selected_source() != "realsense":
+        if self.worker is None or not self.worker.isRunning() or self.config.source != "realsense":
             QMessageBox.warning(self, "无法标定", "请先连接 RealSense，再开始初始标定。")
             return
         if self.recorder.active:
@@ -417,9 +513,9 @@ class MainWindow(QMainWindow):
             return
         self._rs_calibration_samples = []
         self._rs_calibration_frames.clear()
-        self.record_button.setEnabled(False)
+        self.camera_view.set_record_enabled(False)
         target = self.config.realsense.calibration_samples
-        self.realsense_form.set_calibration_progress(0, target)
+        self.settings_panel.set_calibration_progress(0, target)
 
     def _collect_realsense_calibration(self, samples: tuple[PoseSample, ...]) -> None:
         if self._rs_calibration_samples is None:
@@ -433,14 +529,14 @@ class MainWindow(QMainWindow):
             ):
                 continue
             if sample.quality is not None and sample.quality < 0.999:
-                self.realsense_form.set_calibration_progress(len(self._rs_calibration_samples), target)
+                self.settings_panel.set_calibration_progress(len(self._rs_calibration_samples), target)
                 return
             self._rs_calibration_frames.add(sample.frame_number)
             self._rs_calibration_samples.append(sample)
             if len(self._rs_calibration_samples) >= target:
                 break
         current = len(self._rs_calibration_samples)
-        self.realsense_form.set_calibration_progress(current, target)
+        self.settings_panel.set_calibration_progress(current, target)
         if current < target:
             return
 
@@ -456,133 +552,218 @@ class MainWindow(QMainWindow):
                 f"标定未保存：位置波动 {result.position_rms_mm:.2f} mm，"
                 f"角度波动 {result.max_angle_deviation_deg:.2f}°"
             )
-            self.realsense_form.finish_calibration(message)
-            self.record_button.setEnabled(True)
-            QMessageBox.warning(
-                self,
-                "标定板不稳定",
-                message + "\n请固定相机和标定板，并确保所有 Tag 完整可见后重试。",
-            )
+            self.settings_panel.finish_calibration(message)
+            self.camera_view.set_record_enabled(True)
+            QMessageBox.warning(self, "标定板不稳定", message)
             return
 
         reference = tuple(float(value) for value in result.reference_transform.reshape(-1))
         calibrated = replace(rs, reference_transform=reference)
         try:
-            env_path = save_realsense_config(self.config.root, calibrated)
-        except OSError as exc:
-            self.realsense_form.finish_calibration("初始零点保存失败")
-            self.record_button.setEnabled(True)
+            save_realsense_config(self.config.root, calibrated)
+            self.config = replace(self.config, realsense=calibrated)
+            self.database.save_config(self.config)
+        except (OSError, ValueError) as exc:
+            self.settings_panel.finish_calibration("初始零点保存失败")
+            self.camera_view.set_record_enabled(True)
             QMessageBox.warning(self, "保存失败", str(exc))
             return
-        self.config = replace(self.config, realsense=calibrated)
-        self.realsense_form.load_config(calibrated)
-        self.realsense_form.set_connection_active(True, calibration_available=True)
-        self.realsense_form.finish_calibration(
+        self.settings_panel.load_config(self.config)
+        self.settings_panel.set_connected(True)
+        self.settings_panel.finish_calibration(
             f"● 标定完成 · RMS {result.position_rms_mm:.2f} mm / {result.max_angle_deviation_deg:.2f}°"
         )
-        self.config_label.setText(self._config_summary())
         self._last_samples.clear()
-        self.spatial_view.clear()
-        self.statusBar().showMessage(f"初始零点已保存：{env_path}", 8000)
-        self.record_button.setEnabled(True)
+        self.camera_view.set_record_enabled(True)
 
     def _clear_realsense_calibration(self) -> None:
         if self.recorder.active:
-            QMessageBox.warning(self, "无法清除", "请先停止当前 CSV 录制，再清除初始零点。")
+            QMessageBox.warning(self, "无法清除", "请先停止当前录制，再清除初始零点。")
             return
-        self._rs_calibration_samples = None
-        self._rs_calibration_frames.clear()
         identity = tuple(float(value) for value in np.eye(4).reshape(-1))
         realsense = replace(self.config.realsense, reference_transform=identity)
         try:
             save_realsense_config(self.config.root, realsense)
-        except OSError as exc:
+            self.config = replace(self.config, realsense=realsense)
+            self.database.save_config(self.config)
+        except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "清除失败", str(exc))
             return
-        self.config = replace(self.config, realsense=realsense)
-        self.realsense_form.load_config(realsense)
-        self.realsense_form.set_connection_active(
-            self.worker is not None and self.worker.isRunning(),
-            calibration_available=self.worker is not None and self.worker.isRunning(),
-        )
-        self.config_label.setText(self._config_summary())
+        self.settings_panel.load_config(self.config)
         self._last_samples.clear()
-        self.spatial_view.clear()
-        self.statusBar().showMessage("RealSense 初始零点已清除", 6000)
 
     def _on_failed(self, message: str) -> None:
-        self.status_badge.setText("● 连接失败")
+        self._session_failed = True
+        self._set_device_status("danger", "● 连接失败")
         QMessageBox.critical(self, "设备错误", message)
 
     def _on_stopped(self) -> None:
+        if self.recorder.active:
+            self._last_export_path = self.recorder.stop()
+        if self._session_id is not None:
+            self.database.end_session(
+                self._session_id,
+                status="failed" if self._session_failed else "completed",
+                export_path=self._last_export_path,
+            )
+            self._session_id = None
         self.worker = None
+        self._record_started_at = None
         self._rs_calibration_samples = None
         self._rs_calibration_frames.clear()
-        self.status_badge.setProperty("connected", False)
-        self.status_badge.setText("● 未连接")
-        self.status_badge.style().unpolish(self.status_badge)
-        self.status_badge.style().polish(self.status_badge)
-        self.mode_switcher.setEnabled(True)
-        self.realsense_form.set_connection_active(False)
-        self.realsense_form.finish_calibration()
-        self.ndi_form.set_connection_active(False)
-        self._sync_source_panels()
-        self.connect_button.setText("连接设备")
-        self.connect_button.setEnabled(True)
-        self.record_button.setEnabled(False)
-        self.record_button.setText(self._idle_record_button_text())
-        self.source_card.set_value(
-            f"{self.SOURCE_DISPLAY_NAMES[self._selected_source()]} · 待连接"
-        )
+        self._set_device_status("offline", "● 设备离线")
+        self.device_label.setText(self.SOURCE_NAMES[self.config.source])
+        self.settings_panel.set_connected(False)
+        self.settings_panel.finish_calibration()
+        self.camera_view.set_record_enabled(False)
+        self.camera_view.set_recording(False, 0)
+
+    def _set_device_status(self, state: str, text: str) -> None:
+        self.device_status.setText(text)
+        self.device_status.setProperty("state", state)
+        self.device_status.style().unpolish(self.device_status)
+        self.device_status.style().polish(self.device_status)
+
+    def _open_spatial_view(self) -> None:
+        if self.spatial_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Open3D 三维空间")
+            dialog.resize(900, 620)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 12, 12, 12)
+            self.spatial_view = Open3DViewWidget(self.config.open3d)
+            layout.addWidget(self.spatial_view)
+            dialog.finished.connect(self._close_spatial_view)
+            self.spatial_dialog = dialog
+        self.spatial_dialog.show()
+        self.spatial_dialog.raise_()
+        self.spatial_dialog.activateWindow()
+
+    def _close_spatial_view(self) -> None:
+        if self.spatial_view is not None:
+            self.spatial_view.shutdown()
+        self.spatial_view = None
+        self.spatial_dialog = None
+
+    def _reset_live_state(self) -> None:
+        self._frame_times.clear()
+        self._last_packet_at = None
+        self._last_samples.clear()
+        self._tag_tones.clear()
+        for history in self._tag_histories.values():
+            history.clear()
+        self.fps_card.set_value("0 FPS")
+        self.latency_card.set_value("— ms")
+        self.roll_pitch_card.set_value("—° / —°")
+        self.yaw_card.set_value("—°")
+        self.camera_view.canvas.set_frame(None, (), {})
+        if self.spatial_view is not None:
+            self.spatial_view.clear()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._closed:
+            event.accept()
+            return
+        self._closed = True
         if self.recorder.active:
-            self.recorder.stop()
+            self._last_export_path = self.recorder.stop()
         if self.worker is not None and self.worker.isRunning():
             self.worker.requestInterruption()
             self.worker.wait(2500)
-        self.spatial_view.shutdown()
+        if self._session_id is not None:
+            self.database.end_session(
+                self._session_id,
+                status="failed" if self._session_failed else "completed",
+                export_path=self._last_export_path,
+            )
+            self._session_id = None
+        if self.spatial_view is not None:
+            self.spatial_view.shutdown()
+        self.database.close()
         event.accept()
 
     def _apply_style(self) -> None:
-        self.setFont(QFont("Arial", 10))
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #0b121b; color: #dce7f2; }
+        self.setFont(app_font(10))
+        self.setStyleSheet(
+            """
+            QMainWindow, #appRoot, #workspace, #mainView { background: #F7F9FC; color: #0B121B; }
             QLabel { background: transparent; }
-            #pageTitle { font-size: 27px; font-weight: 700; color: #f4f8fb; }
-            #subtitle, #metricTitle { color: #8293a6; }
-            #statusBadge { background: #273443; color: #b6c1cc; padding: 8px 14px; border-radius: 14px; }
-            #statusBadge[connected="true"] { background: #113e35; color: #59e0b9; }
-            #controlBar, #metricCard, #configPanel, #ndiConfigPanel, #realsenseConfigPanel { background: #121d29; border: 1px solid #213043; border-radius: 9px; }
-            #modeSwitcher { background: #0d1721; border: 1px solid #2b3e52; border-radius: 7px; }
-            QPushButton#modeButton { background: transparent; color: #91a4b6; padding: 8px 14px; border-radius: 5px; font-weight: 600; }
-            QPushButton#modeButton:hover { background: #1b2a39; color: #dce7f2; }
-            QPushButton#modeButton:checked { background: #16a884; color: #0b121b; }
-            QPushButton#modeButton:checked:disabled { background: #127e65; color: #0b121b; }
-            #metricValue { font-size: 21px; font-weight: 650; color: #f0f6fa; }
-            #sectionTitle { font-size: 15px; font-weight: 650; margin: 4px 0; }
-            #configPanel { color: #9eafbf; padding: 13px; line-height: 1.5; }
-            #ndiConfigTitle { color: #f0f6fa; font-size: 14px; font-weight: 650; }
-            #ndiConfigHint { color: #8293a6; }
-            #realsenseConfigTitle { color: #f0f6fa; font-size: 14px; font-weight: 650; }
-            #realsenseExportNote { color: #8293a6; }
-            #calibrationStatus { color: #8293a6; }
-            #calibrationStatus[calibrated="true"] { color: #59e0b9; }
-            #videoPanel, #open3dPanel { background: #101923; border: 1px solid #213043; border-radius: 9px; color: #718397; }
-            #open3dTitle { color: #dce7f2; font-size: 14px; font-weight: 650; }
-            #open3dSummary { color: #8293a6; }
-            #open3dCanvas { background: #0a1017; border-radius: 6px; color: #718397; }
-            QPushButton { background: #26374a; border: 0; padding: 9px 16px; border-radius: 6px; }
-            QPushButton:hover { background: #31475e; }
-            QPushButton:disabled { color: #627183; background: #1b2734; }
-            #primaryButton { background: #16a884; color: #0b121b; font-weight: 650; }
-            #primaryButton:hover { background: #1bbb94; }
-            #calibrationButton { border: 1px solid #16a884; color: #59e0b9; background: #113e35; }
-            #calibrationButton:disabled { border-color: #26374a; color: #627183; background: #1b2734; }
-            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { background: #0d1721; border: 1px solid #2b3e52; padding: 8px 12px; border-radius: 6px; }
-            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: #16a884; }
-            QTableWidget { background: #101923; alternate-background-color: #142130; border: 1px solid #213043; gridline-color: #213043; border-radius: 7px; }
-            QHeaderView::section { background: #182535; color: #9fb0c0; border: 0; border-bottom: 1px solid #2a3a4b; padding: 8px; }
-            QSplitter::handle { background: #162331; width: 2px; }
-            QStatusBar { color: #91a4b6; }
-        """)
+            #appHeader { background: #FFFFFF; border-bottom: 1px solid #D9E0E8; }
+            #appTitle { color: #003A99; font-size: 18px; font-weight: 700; }
+            #headerSeparator { background: #D9E0E8; }
+            #deviceLabel { color: #0B121B; font-size: 13px; font-weight: 500; }
+            #clockLabel { color: #3F4D5A; font-family: "Helvetica Neue"; font-size: 12px; }
+            #deviceStatus { color: #5C6A78; font-size: 12px; font-weight: 500; }
+            #deviceStatus[state="online"] { color: #12B76A; }
+            #deviceStatus[state="connecting"] { color: #FFB020; }
+            #deviceStatus[state="danger"] { color: #E5484D; }
+
+            #cameraView { background: #06101B; border: 0; }
+            #glassButton, #recordControl, #recordTimer, #layerPanel {
+                background: rgba(9, 14, 20, 175); color: #FFFFFF;
+                border: 1px solid rgba(255, 255, 255, 62); border-radius: 8px;
+            }
+            #glassButton { padding: 11px; }
+            #layerPanel { border-radius: 8px; }
+            QPushButton#layerToggle {
+                background: rgba(9, 14, 20, 175); color: #FFFFFF;
+                border: 1px solid rgba(255, 255, 255, 62); border-radius: 6px;
+                padding: 4px 10px; text-align: left; font-size: 13px;
+            }
+            QPushButton#layerToggle:checked { color: #FFFFFF; }
+            QPushButton#layerToggle:!checked { color: #7F8A96; }
+            #recordTimer { font-size: 14px; font-weight: 500; }
+            #recordControl { font-size: 15px; font-weight: 600; }
+            #recordControl:disabled { color: #7F8A96; background: rgba(9, 14, 20, 120); }
+            #recordControl[active="true"] { color: #FFFFFF; }
+            #recordTimer { color: #FFFFFF; }
+
+            #metricBar { background: #FFFFFF; border-top: 1px solid #D9E0E8; }
+            #metricCard { background: #FFFFFF; border: 1px solid #D9E0E8; border-radius: 12px; }
+            #metricLabel { color: #3F4D5A; font-size: 12px; font-weight: 500; }
+            #metricValue { color: #0B121B; font-family: "Helvetica Neue"; font-size: 22px; font-weight: 600; }
+
+            #rightSidebar { background: #FFFFFF; border-left: 1px solid #D9E0E8; }
+            QTabWidget#sidebarTabs::pane { border: 0; background: #FFFFFF; }
+            QTabBar::tab {
+                background: #FFFFFF; color: #3F4D5A; border: 0;
+                border-bottom: 1px solid #D9E0E8; min-width: 170px; height: 43px;
+                font-size: 14px; font-weight: 500;
+            }
+            QTabBar::tab:selected { color: #003A99; border-bottom: 3px solid #0049C0; }
+            #monitorScroll, #settingsScroll, #monitorScroll > QWidget > QWidget,
+            #settingsScroll > QWidget > QWidget { background: #FFFFFF; }
+            QScrollBar:vertical { background: #FFFFFF; width: 8px; margin: 0; }
+            QScrollBar::handle:vertical { background: #D9E0E8; border-radius: 4px; min-height: 28px; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+            #tagMonitorCard { background: #FFFFFF; border: 1px solid #D9E0E8; border-radius: 12px; }
+            #tagId { color: #0B121B; font-size: 16px; font-weight: 700; }
+            #tagConfig { color: #5C6A78; font-size: 12px; font-weight: 500; }
+            #tagCoordinates { color: #0B121B; font-size: 14px; font-weight: 500; }
+            #tagOffset { color: #0B121B; font-size: 12px; font-weight: 500; }
+            #tagStatus { background: #EEF2F7; color: #12B76A; border-radius: 10px; padding: 4px 8px; font-size: 12px; font-weight: 500; }
+            #tagAction { background: #E5484D; color: #FFFFFF; border: 0; border-radius: 8px; font-size: 14px; }
+            #tagMonitorCard[tone="proximity"] #tagOffset,
+            #tagMonitorCard[tone="proximity"] #tagStatus { color: #FFB020; }
+            #tagMonitorCard[tone="danger"] #tagOffset,
+            #tagMonitorCard[tone="danger"] #tagStatus { color: #E5484D; }
+            #tagMonitorCard[running="false"] #tagAction { background: #0049C0; }
+
+            #settingsPanel { background: #FFFFFF; }
+            #settingsSectionTitle { color: #0B121B; font-size: 14px; font-weight: 700; }
+            #settingsHint, #databasePath, #calibrationStatus { color: #5C6A78; font-size: 12px; }
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
+                background: #FFFFFF; color: #0B121B; border: 1px solid #D9E0E8;
+                border-radius: 6px; min-height: 34px; padding: 0 8px;
+            }
+            QComboBox:focus, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #0049C0; }
+            QPushButton { background: #EEF2F7; color: #3F4D5A; border: 0; border-radius: 8px; padding: 8px 12px; }
+            QPushButton:hover { background: #E4EAF2; }
+            QPushButton:disabled { color: #98A2B3; background: #F2F4F7; }
+            #primaryAction { background: #0049C0; color: #FFFFFF; font-weight: 500; }
+            #primaryAction:hover { background: #003A99; }
+            #secondaryAction { background: #EEF2F7; color: #3F4D5A; }
+            #emptyState { color: #5C6A78; padding: 32px; }
+            """
+        )

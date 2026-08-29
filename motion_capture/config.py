@@ -90,6 +90,7 @@ class AppConfig:
     realsense: RealSenseConfig
     ndi: NDIConfig
     open3d: Open3DConfig
+    database_path: Path
 
 
 def save_source_mode(root: Path, source: str) -> Path:
@@ -374,4 +375,15 @@ def load_config(root: Path | None = None, environ: Mapping[str, str] | None = No
     poll_hz = _integer(values, "MOCAP_POLL_HZ", 30)
     if not 1 <= poll_hz <= 240:
         raise ValueError("MOCAP_POLL_HZ 必须在 1 到 240 之间")
-    return AppConfig(root, source, poll_hz, record_dir.resolve(), realsense, ndi, open3d)
+    database_value = Path(values.get("MOCAP_DATABASE_PATH", "data/motion_capture.sqlite3")).expanduser()
+    database_path = database_value if database_value.is_absolute() else root / database_value
+    return AppConfig(
+        root,
+        source,
+        poll_hz,
+        record_dir.resolve(),
+        realsense,
+        ndi,
+        open3d,
+        database_path.resolve(),
+    )
