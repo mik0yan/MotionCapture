@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -9,14 +11,21 @@ from motion_capture.video_recorder import FFmpegVideoRecorder
 
 
 def _fake_ffmpeg(tmp_path: Path) -> Path:
-    executable = tmp_path / "fake_ffmpeg.py"
-    executable.write_text(
-        "#!/usr/bin/env python3\n"
+    payload_code = (
         "import pathlib, sys\n"
         "payload = sys.stdin.buffer.read()\n"
-        "pathlib.Path(sys.argv[-1]).write_bytes(payload)\n",
-        encoding="utf-8",
+        "pathlib.Path(sys.argv[-1]).write_bytes(payload)\n"
     )
+    if os.name == "nt":
+        # Windows 无法直接执行 shebang 脚本，用 cmd 批处理转发给当前解释器；
+        # Popen 可直接执行 .bat，stdin 管道会透传给 python 子进程。
+        script = tmp_path / "fake_ffmpeg.py"
+        script.write_text(payload_code, encoding="utf-8")
+        wrapper = tmp_path / "fake_ffmpeg.bat"
+        wrapper.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        return wrapper
+    executable = tmp_path / "fake_ffmpeg.py"
+    executable.write_text("#!/usr/bin/env python3\n" + payload_code, encoding="utf-8")
     executable.chmod(0o755)
     return executable
 

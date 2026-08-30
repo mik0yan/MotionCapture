@@ -287,9 +287,9 @@ def save_ndi_config(root: Path, config: NDIConfig) -> Path:
     serialized_roms: list[str] = []
     for path in config.rom_files:
         try:
-            serialized_roms.append(str(path.relative_to(root)))
+            serialized_roms.append(path.relative_to(root).as_posix())
         except ValueError:
-            serialized_roms.append(str(path))
+            serialized_roms.append(path.as_posix())
     values = {
         "NDI_TRACKER_TYPE": config.tracker_type,
         "NDI_IP_ADDRESS": config.ip_address,

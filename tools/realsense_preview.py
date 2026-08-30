@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.check_realsense import capture_devices, realsense_capture_device, realsense_usb_devices
+from tools.check_realsense import capture_devices, realsense_capture_device, realsense_usb_devices, uvc_backend
 
 
 # D435i 彩色相机标称水平 FOV，用于 UVC 模式下反推焦距。
@@ -155,19 +155,23 @@ class UvcSource(FrameSource):
         """在 GUI 主线程试开一次：macOS 的摄像头授权请求只能从主 run loop 发起。"""
         import cv2
 
-        capture = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+        capture = cv2.VideoCapture(self.index, uvc_backend())
         opened = capture.isOpened()
         capture.release()
         if not opened:
-            raise RuntimeError(
-                f"无法打开摄像头索引 {self.index}。设备在 USB 上可见时，通常是 macOS 摄像头权限未授予当前程序："
-                "系统设置 → 隐私与安全性 → 摄像头 中勾选运行本脚本的终端/IDE，然后完全退出并重开它。"
-            )
+            if sys.platform == "darwin":
+                hint = (
+                    "通常是 macOS 摄像头权限未授予当前程序："
+                    "系统设置 → 隐私与安全性 → 摄像头 中勾选运行本脚本的终端/IDE，然后完全退出并重开它。"
+                )
+            else:
+                hint = "确认摄像头未被其他程序独占，或用 --index 换一个索引重试。"
+            raise RuntimeError(f"无法打开摄像头索引 {self.index}。{hint}")
 
     def start(self) -> None:
         import cv2
 
-        capture = cv2.VideoCapture(self.index, cv2.CAP_AVFOUNDATION)
+        capture = cv2.VideoCapture(self.index, uvc_backend())
         if not capture.isOpened():
             capture.release()
             raise RuntimeError(f"无法打开摄像头索引 {self.index}")

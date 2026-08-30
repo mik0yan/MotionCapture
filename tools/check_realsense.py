@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import time
@@ -62,6 +63,16 @@ def _run(command: list[str]) -> bytes:
 
 
 def usb_devices() -> tuple[UsbDevice, ...]:
+    if sys.platform == "darwin":
+        return _darwin_usb_devices()
+    if sys.platform == "win32":
+        return _windows_usb_devices()
+    if sys.platform.startswith("linux"):
+        return _linux_usb_devices()
+    return ()
+
+
+def _darwin_usb_devices() -> tuple[UsbDevice, ...]:
     tree = plistlib.loads(_run(["ioreg", "-a", "-r", "-c", "IOUSBHostDevice", "-l", "-w0"]))
     found: dict[int, UsbDevice] = {}
 
@@ -89,6 +100,62 @@ def usb_devices() -> tuple[UsbDevice, ...]:
     return tuple(found.values())
 
 
+def _windows_usb_devices() -> tuple[UsbDevice, ...]:
+    script = (
+        "Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\\VID_*' } | "
+        "ForEach-Object { \"$($_.InstanceId)|$($_.FriendlyName)\" }"
+    )
+    output = _run(["powershell", "-NoProfile", "-Command", script]).decode("utf-8", errors="replace")
+    devices: list[UsbDevice] = []
+    for line in output.splitlines():
+        entry = line.strip()
+        if not entry:
+            continue
+        instance_id, _, name = entry.partition("|")
+        match = re.search(r"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})", instance_id)
+        if match is None:
+            continue
+        # USB\VID_xxxx&PID_yyyy\<serial> 的末段通常是序列号；Windows 生成的
+        # 临时实例号（含 & ）没有稳定意义，但保留作诊断线索。
+        serial = instance_id.rsplit("\\", 1)[-1]
+        devices.append(
+            UsbDevice(
+                name=name.strip() or "(未命名设备)",
+                serial=serial,
+                vendor_id=int(match.group(1), 16),
+                product_id=int(match.group(2), 16),
+                speed=None,
+                location_id=0,
+                hub_chain=(),
+            )
+        )
+    return tuple(devices)
+
+
+def _linux_usb_devices() -> tuple[UsbDevice, ...]:
+    try:
+        output = _run(["lsusb"]).decode("utf-8", errors="replace")
+    except (OSError, RuntimeError):
+        return ()
+    devices: list[UsbDevice] = []
+    for line in output.splitlines():
+        match = re.search(r"ID ([0-9a-fA-F]{4}):([0-9a-fA-F]{4}) (.+)$", line.strip())
+        if match is None:
+            continue
+        devices.append(
+            UsbDevice(
+                name=match.group(3).strip() or "(未命名设备)",
+                serial="",
+                vendor_id=int(match.group(1), 16),
+                product_id=int(match.group(2), 16),
+                speed=None,
+                location_id=0,
+                hub_chain=(),
+            )
+        )
+    return tuple(devices)
+
+
 def realsense_usb_devices() -> tuple[UsbDevice, ...]:
     return tuple(
         device
@@ -102,24 +169,48 @@ def _system_profiler_cameras() -> tuple[str, ...]:
     return tuple(str(item.get("_name", "")).strip() for item in payload.get("SPCameraDataType", []))
 
 
-def capture_devices() -> tuple[CaptureDevice, ...]:
-    """按 OpenCV AVFoundation 后端使用的顺序枚举摄像头。
-
-    cap_avfoundation_mac.mm 取的是 devicesWithMediaType(Video) 拼接
-    devicesWithMediaType(Muxed)，因此这里的下标即 VideoCapture 的索引。
-    system_profiler 的顺序不稳定，只在没有 pyobjc 时兜底。
-    """
-    try:
-        import AVFoundation as AVF
-    except ImportError:
-        return tuple(CaptureDevice(index, name, "") for index, name in enumerate(_system_profiler_cameras()))
-
-    video = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeVideo) or []
-    muxed = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeMuxed) or []
-    return tuple(
-        CaptureDevice(index, str(device.localizedName()), str(device.uniqueID()))
-        for index, device in enumerate(list(video) + list(muxed))
+def _windows_pnp_cameras() -> tuple[str, ...]:
+    script = (
+        "Get-PnpDevice -Class Camera -PresentOnly | "
+        "Sort-Object FriendlyName | "
+        "ForEach-Object { $_.FriendlyName }"
     )
+    output = _run(["powershell", "-NoProfile", "-Command", script]).decode("utf-8", errors="replace")
+    return tuple(line.strip() for line in output.splitlines() if line.strip())
+
+
+def _linux_video_devices() -> tuple[str, ...]:
+    if not os.path.isdir("/dev"):
+        return ()
+    return tuple(
+        f"/dev/{name}" for name in sorted(os.listdir("/dev")) if re.fullmatch(r"video\d+", name)
+    )
+
+
+def capture_devices() -> tuple[CaptureDevice, ...]:
+    """枚举 OpenCV VideoCapture 可用的摄像头。
+
+    macOS 上按 AVFoundation 后端顺序（Video + Muxed）返回，下标即 VideoCapture
+    的索引，可用 pyobjc 交叉验证 uniqueID。Windows/Linux 枚举接口不保证与
+    OpenCV 后端顺序一致，索引仅作参考，必要时用 --index 手动指定。
+    """
+    if sys.platform == "darwin":
+        try:
+            import AVFoundation as AVF
+        except ImportError:
+            return tuple(CaptureDevice(index, name, "") for index, name in enumerate(_system_profiler_cameras()))
+
+        video = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeVideo) or []
+        muxed = AVF.AVCaptureDevice.devicesWithMediaType_(AVF.AVMediaTypeMuxed) or []
+        return tuple(
+            CaptureDevice(index, str(device.localizedName()), str(device.uniqueID()))
+            for index, device in enumerate(list(video) + list(muxed))
+        )
+    if sys.platform == "win32":
+        return tuple(CaptureDevice(index, name, "") for index, name in enumerate(_windows_pnp_cameras()))
+    if sys.platform.startswith("linux"):
+        return tuple(CaptureDevice(index, name, "") for index, name in enumerate(_linux_video_devices()))
+    return ()
 
 
 def realsense_capture_device() -> CaptureDevice | None:
@@ -129,6 +220,14 @@ def realsense_capture_device() -> CaptureDevice | None:
     for device in devices:
         uid = device.unique_id.lower().removeprefix("0x")
         if any(uid == camera.avfoundation_uid for camera in usb):
+            return device
+
+    def is_color(node: CaptureDevice) -> bool:
+        lowered = node.name.lower()
+        return "realsense" in lowered and ("rgb" in lowered or "color" in lowered)
+
+    for device in devices:
+        if is_color(device):
             return device
     for device in devices:
         if "realsense" in device.name.lower():
@@ -169,11 +268,23 @@ def pyrealsense_report() -> list[str]:
             )
     except Exception as exc:
         lines.append(f"读取设备信息失败: {type(exc).__name__}: {exc}")
-        if "power state" in str(exc).lower() or os.geteuid() != 0:
+        # os.geteuid 仅存在于 Unix；Windows 上平台判断必须短路在前。
+        if "power state" in str(exc).lower() or (hasattr(os, "geteuid") and os.geteuid() != 0):
             lines.append("原因: macOS 12+ 的 USB 安全策略要求 librealsense 以 root 访问设备。")
             lines.append("用 sudo 重跑本脚本即可读到设备信息，例如:")
             lines.append("  sudo .venv/bin/python tools/check_realsense.py")
     return lines
+
+
+def uvc_backend() -> int:
+    """按平台选择 OpenCV VideoCapture 后端常量。"""
+    import cv2
+
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if sys.platform == "win32":
+        return cv2.CAP_DSHOW
+    return cv2.CAP_ANY
 
 
 def probe_opencv(indices: list[int]) -> bool:
@@ -189,7 +300,7 @@ def probe_opencv(indices: list[int]) -> bool:
     for index in indices:
         print(f"  索引 {index} ({names.get(index, '?')}) 试打开...", end=" ", flush=True)
         started = time.monotonic()
-        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+        capture = cv2.VideoCapture(index, uvc_backend())
         if not capture.isOpened():
             capture.release()
             print(f"失败 ({time.monotonic() - started:.1f}s)", flush=True)
@@ -216,16 +327,21 @@ def main(argv: list[str] | None = None) -> int:
     cameras = realsense_usb_devices()
     if not cameras:
         print("未在 USB 总线上找到 RealSense 相机。检查线缆与供电，确认使用数据线而非充电线。")
+        if sys.platform != "darwin":
+            print("（Windows/Linux 按设备名称匹配，若 SDK 能枚举到设备则以 SDK 结果为准）")
     for device in cameras:
         print(f"设备: {device.name}")
         print(f"  序列号: {device.serial or '(无)'}")
         print(f"  VID:PID: 0x{device.vendor_id:04X}:0x{device.product_id:04X}")
         print(f"  链路速率: {device.speed_label}")
-        print(f"  接入路径: {' -> '.join(device.hub_chain) if device.hub_chain else '直连主机端口'}")
-        if not device.is_usb3:
-            print("  警告: 以 USB 2.0 及以下速率握手，深度+彩色高分辨率同步会受限。改用 USB 3 端口与线缆。")
         if device.hub_chain:
-            print("  提示: 经由 Hub 连接，带宽不足时优先改为直连主机端口。")
+            print(f"  接入路径: {' -> '.join(device.hub_chain)}")
+        elif sys.platform == "darwin":
+            print("  接入路径: 直连主机端口")
+        else:
+            print("  接入路径: 未知（当前平台不提供 Hub 拓扑）")
+        if device.speed is not None and not device.is_usb3:
+            print("  警告: 以 USB 2.0 及以下速率握手，深度+彩色高分辨率同步会受限。改用 USB 3 端口与线缆。")
 
     print()
     print("=== pyrealsense2 (深度/红外/对齐所需) ===")
@@ -253,7 +369,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             indices = [device.index for device in capture_devices()]
         if not probe_opencv(indices):
-            print("  没读到画面。若上方出现 not authorized，需在 系统设置 → 隐私与安全性 → 摄像头 授权当前终端，并 ⌘Q 完全退出后重开。")
+            if sys.platform == "darwin":
+                print("  没读到画面。若上方出现 not authorized，需在 系统设置 → 隐私与安全性 → 摄像头 授权当前终端，并 ⌘Q 完全退出后重开。")
+            else:
+                print("  没读到画面。确认摄像头未被其他程序独占，或用 --index 换一个索引重试。")
 
     return 0 if cameras else 1
 
