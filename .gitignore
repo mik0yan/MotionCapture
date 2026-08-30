@@ -6,6 +6,10 @@ __pycache__/
 .DS_Store
 recordings/*.csv
 recordings/*.xlsx
+recordings/*.mp4
+recordings/*.json
+recordings/*.ffmpeg.log
+recordings/.capture_*.partial.mp4
 roms/*.rom
 data/*.sqlite3
 data/*.sqlite3-shm
