@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import math
+import time
+from collections import deque
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -77,6 +80,98 @@ class CameraFrame:
     image: np.ndarray | None
     detections: tuple[TagDetection, ...]
     tones: dict[int, str]
+    displacements: dict[int, "PixelDisplacement"] = field(default_factory=dict)
+    direction_tags: frozenset[int] = frozenset()
+
+
+@dataclass(frozen=True)
+class PixelDisplacement:
+    """当前平滑位置相对初始基准位置的画面内偏移。"""
+
+    dx_px: float
+    dy_px: float
+    samples_used: int
+
+    @property
+    def distance_px(self) -> float:
+        return math.hypot(self.dx_px, self.dy_px)
+
+
+class TagMotionTracker:
+    """记录每个 Tag 的初始像素基准与近期中心，输出相对初始位置的偏移。
+
+    当前位置取最近 smooth_seconds 内的均值，初始位置取该 Tag 首次被观测的
+    中心；监控重启或 Tag 消失后重新建立基准。
+    """
+
+    def __init__(self, window_seconds: float = 5.0, smooth_seconds: float = 0.2, max_samples: int = 256) -> None:
+        self.window_seconds = float(window_seconds)
+        self.smooth_seconds = float(smooth_seconds)
+        self._max_samples = max(4, int(max_samples))
+        self._history: dict[int, deque[tuple[float, float, float]]] = {}
+        self._initial: dict[int, tuple[float, float]] = {}
+
+    def update(self, now: float, detections: tuple[TagDetection, ...]) -> None:
+        seen: set[int] = set()
+        for detection in detections:
+            if len(detection.corners_px) != 4:
+                continue
+            center_x = sum(x for x, _ in detection.corners_px) / 4.0
+            center_y = sum(y for _, y in detection.corners_px) / 4.0
+            if detection.tag_id not in self._initial:
+                self._initial[detection.tag_id] = (center_x, center_y)
+            history = self._history.setdefault(
+                detection.tag_id, deque(maxlen=self._max_samples)
+            )
+            history.append((now, center_x, center_y))
+            seen.add(detection.tag_id)
+        for tag_id in [tag_id for tag_id in self._history if tag_id not in seen]:
+            del self._history[tag_id]
+            self._initial.pop(tag_id, None)
+        for history in self._history.values():
+            while history and history[0][0] < now - self.window_seconds:
+                history.popleft()
+
+    def displacement(self, tag_id: int) -> PixelDisplacement | None:
+        history = self._history.get(tag_id)
+        initial = self._initial.get(tag_id)
+        if history is None or initial is None or len(history) < 2:
+            return None
+        recent = [item for item in history if item[0] >= history[-1][0] - self.smooth_seconds]
+        if not recent:
+            recent = [history[-1]]
+        current_x = sum(item[1] for item in recent) / len(recent)
+        current_y = sum(item[2] for item in recent) / len(recent)
+        return PixelDisplacement(
+            current_x - initial[0],
+            current_y - initial[1],
+            len(recent),
+        )
+
+    def displacements(self) -> dict[int, PixelDisplacement]:
+        return {
+            tag_id: displacement
+            for tag_id in self._history
+            if (displacement := self.displacement(tag_id)) is not None
+        }
+
+    def reset_tag(self, tag_id: int) -> None:
+        self._history.pop(tag_id, None)
+        self._initial.pop(tag_id, None)
+
+    def reset(self) -> None:
+        self._history.clear()
+        self._initial.clear()
+
+
+# 箭头参数以源图像像素为单位，随后与 Tag 框一起映射到画布坐标。
+# 偏移 gating 由主窗口按各 Tag 卡片的毫米阈值判定；画面内的最小像素距离
+# 只用于排除深度轴向运动等画面位移过小、方向无意义的场景。
+DIRECTION_MIN_DISPLACEMENT_PX = 8.0
+DIRECTION_MIN_LENGTH_PX = 20.0
+DIRECTION_MAX_LENGTH_PX = 90.0
+DIRECTION_HEAD_LENGTH_PX = 12.0
+DIRECTION_HEAD_ANGLE_RAD = math.radians(26.0)
 
 
 class CameraCanvas(QWidget):
@@ -86,6 +181,8 @@ class CameraCanvas(QWidget):
         self.show_rgb = True
         self.show_depth = True
         self.show_tags = True
+        self.show_direction = True
+        self.motion_tracker = TagMotionTracker()
         self.setMinimumSize(640, 420)
 
     def set_frame(
@@ -93,8 +190,17 @@ class CameraCanvas(QWidget):
         image: np.ndarray | None,
         detections: tuple[TagDetection, ...],
         tones: dict[int, str],
+        direction_tags: frozenset[int] | set[int] = frozenset(),
     ) -> None:
-        self.frame = CameraFrame(None if image is None else np.asarray(image).copy(), detections, tones)
+        self.motion_tracker.update(time.monotonic(), detections)
+        image_copy = None if image is None else np.asarray(image).copy()
+        self.frame = CameraFrame(
+            image_copy,
+            detections,
+            tones,
+            self.motion_tracker.displacements(),
+            frozenset(direction_tags),
+        )
         self.update()
 
     def set_layer(self, layer: str, visible: bool) -> None:
@@ -104,6 +210,8 @@ class CameraCanvas(QWidget):
             self.show_depth = visible
         elif layer == "tags":
             self.show_tags = visible
+        elif layer == "direction":
+            self.show_direction = visible
         self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
@@ -150,11 +258,12 @@ class CameraCanvas(QWidget):
         if self.show_tags:
             scale_x = draw_rect.width() / source_size[0]
             scale_y = draw_rect.height() / source_size[1]
+
+            def to_canvas(x: float, y: float) -> QPointF:
+                return QPointF(draw_rect.x() + x * scale_x, draw_rect.y() + y * scale_y)
+
             for detection in self.frame.detections:
-                points = [
-                    QPointF(draw_rect.x() + x * scale_x, draw_rect.y() + y * scale_y)
-                    for x, y in detection.corners_px
-                ]
+                points = [to_canvas(x, y) for x, y in detection.corners_px]
                 if len(points) != 4:
                     continue
                 tone = self.frame.tones.get(detection.tag_id, "normal")
@@ -177,6 +286,8 @@ class CameraCanvas(QWidget):
                     QPointF(top_left.x(), max(16.0, top_left.y() - 8.0)),
                     f"ID {detection.tag_id:02d}  ·  {detection.distance_mm:.1f} mm",
                 )
+                if self.show_direction:
+                    self._draw_direction_arrow(painter, detection, to_canvas, color)
                 if self.show_depth:
                     center = QPointF(
                         sum(point.x() for point in points) / 4.0,
@@ -190,6 +301,29 @@ class CameraCanvas(QWidget):
                         f"D  {detection.distance_mm:.1f}",
                     )
         painter.end()
+
+    def _draw_direction_arrow(self, painter: QPainter, detection: TagDetection, to_canvas, color: QColor) -> None:
+        if detection.tag_id not in self.frame.direction_tags:
+            return
+        displacement = self.frame.displacements.get(detection.tag_id)
+        if displacement is None or displacement.distance_px < DIRECTION_MIN_DISPLACEMENT_PX:
+            return
+        center_x = sum(x for x, _ in detection.corners_px) / 4.0
+        center_y = sum(y for _, y in detection.corners_px) / 4.0
+        angle = math.atan2(displacement.dy_px, displacement.dx_px)
+        length = min(DIRECTION_MAX_LENGTH_PX, max(DIRECTION_MIN_LENGTH_PX, displacement.distance_px))
+        tip_x = center_x + length * math.cos(angle)
+        tip_y = center_y + length * math.sin(angle)
+        left_x = tip_x - DIRECTION_HEAD_LENGTH_PX * math.cos(angle - DIRECTION_HEAD_ANGLE_RAD)
+        left_y = tip_y - DIRECTION_HEAD_LENGTH_PX * math.sin(angle - DIRECTION_HEAD_ANGLE_RAD)
+        right_x = tip_x - DIRECTION_HEAD_LENGTH_PX * math.cos(angle + DIRECTION_HEAD_ANGLE_RAD)
+        right_y = tip_y - DIRECTION_HEAD_LENGTH_PX * math.sin(angle + DIRECTION_HEAD_ANGLE_RAD)
+        pen = QPen(color, 3)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(to_canvas(center_x, center_y), to_canvas(tip_x, tip_y))
+        painter.drawLine(to_canvas(tip_x, tip_y), to_canvas(left_x, left_y))
+        painter.drawLine(to_canvas(tip_x, tip_y), to_canvas(right_x, right_y))
 
 
 class CameraView(QFrame):
@@ -213,7 +347,7 @@ class CameraView(QFrame):
         panel_layout.setContentsMargins(8, 8, 8, 8)
         panel_layout.setSpacing(4)
         self.layer_toggles: dict[str, QPushButton] = {}
-        for key, label in (("rgb", "RGB"), ("depth", "D"), ("tags", "Tag")):
+        for key, label in (("rgb", "RGB"), ("depth", "D"), ("tags", "Tag"), ("direction", "方向")):
             button = QPushButton(label)
             button.setObjectName("layerToggle")
             button.setCheckable(True)
@@ -240,7 +374,7 @@ class CameraView(QFrame):
         super().resizeEvent(event)
         self.canvas.setGeometry(self.rect())
         self.layer_button.setGeometry(16, 16, 44, 44)
-        self.layer_panel.setGeometry(16, 68, 124, 124)
+        self.layer_panel.setGeometry(16, 68, 124, 156)
         self.record_button.setGeometry(max(16, self.width() - 60), 16, 44, 44)
         self.timer_label.setGeometry(max(16, self.width() - 176), 16, 108, 44)
 

@@ -25,7 +25,6 @@ from motion_capture.config import AppConfig, build_ndi_config, build_realsense_c
 class SettingsPanel(QFrame):
     source_changed = pyqtSignal(str)
     save_requested = pyqtSignal()
-    connect_requested = pyqtSignal()
     calibration_requested = pyqtSignal()
     clear_calibration_requested = pyqtSignal()
     spatial_view_requested = pyqtSignal()
@@ -82,11 +81,7 @@ class SettingsPanel(QFrame):
         self.save_button = QPushButton("保存设置")
         self.save_button.setObjectName("secondaryAction")
         self.save_button.clicked.connect(self.save_requested.emit)
-        self.connect_button = QPushButton("连接设备")
-        self.connect_button.setObjectName("primaryAction")
-        self.connect_button.clicked.connect(self.connect_requested.emit)
         action_row.addWidget(self.save_button)
-        action_row.addWidget(self.connect_button)
         outer.addLayout(action_row)
         outer.addStretch()
         self._settings_inputs = (
@@ -331,15 +326,9 @@ class SettingsPanel(QFrame):
         for widget in self._settings_inputs:
             widget.setEnabled(not active)
         self._sync_ndi_fields()
-        self.connect_button.setText("断开设备" if active else "连接设备")
         self.calibration_button.setEnabled(active and self.selected_source == "realsense")
 
-    def set_connecting(self) -> None:
-        self.connect_button.setEnabled(False)
-        self.connect_button.setText("连接中…")
-
     def set_connected(self, active: bool) -> None:
-        self.connect_button.setEnabled(True)
         self.set_connection_active(active)
 
     def set_calibration_progress(self, current: int, target: int) -> None:

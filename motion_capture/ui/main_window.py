@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QPushButton,
     QDialog,
     QDialogButtonBox,
     QComboBox,
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
         self._tag_histories: dict[int, deque[tuple[float, np.ndarray]]] = {}
         self._tag_reference_positions: dict[int, np.ndarray] = {}
         self._tag_tones: dict[int, str] = {}
+        self._tag_direction_ids: frozenset[int] = frozenset()
         self._rs_calibration_samples: list[PoseSample] | None = None
         self._rs_calibration_frames: set[int] = set()
         self._record_started_at: float | None = None
@@ -121,6 +123,11 @@ class MainWindow(QMainWindow):
         self.device_label = QLabel()
         self.device_label.setObjectName("deviceLabel")
         header_layout.addWidget(self.device_label, 1)
+        self.connect_button = QPushButton("连接设备")
+        self.connect_button.setObjectName("headerConnectButton")
+        self.connect_button.setCursor(Qt.PointingHandCursor)
+        self.connect_button.clicked.connect(self.toggle_connection)
+        header_layout.addWidget(self.connect_button)
         self.device_status = QLabel("● 设备离线")
         self.device_status.setObjectName("deviceStatus")
         self.device_status.setProperty("state", "offline")
@@ -204,7 +211,6 @@ class MainWindow(QMainWindow):
         self.settings_panel = SettingsPanel(self.config)
         self.settings_panel.source_changed.connect(self._on_source_changed)
         self.settings_panel.save_requested.connect(self._save_settings)
-        self.settings_panel.connect_requested.connect(self.toggle_connection)
         self.settings_panel.calibration_requested.connect(self._toggle_realsense_calibration)
         self.settings_panel.clear_calibration_requested.connect(self._clear_realsense_calibration)
         self.settings_panel.spatial_view_requested.connect(self._open_spatial_view)
@@ -220,7 +226,6 @@ class MainWindow(QMainWindow):
         self.statusBar().hide()
 
         self.record_button = self.camera_view.record_button
-        self.connect_button = self.settings_panel.connect_button
 
     def _update_clock_and_recording(self) -> None:
         self.clock_label.setText(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -319,7 +324,8 @@ class MainWindow(QMainWindow):
         if not self._save_settings(notify=False):
             return
         self._reset_live_state()
-        self.settings_panel.set_connecting()
+        self.connect_button.setEnabled(False)
+        self.connect_button.setText("连接中…")
         self.source_switcher.setEnabled(False)
         self.camera_view.set_record_enabled(False)
         self._set_device_status("connecting", "● 正在连接")
@@ -343,8 +349,8 @@ class MainWindow(QMainWindow):
         if self.recorder.active:
             self.toggle_recording()
         if self.worker is not None:
-            self.settings_panel.connect_button.setEnabled(False)
-            self.settings_panel.connect_button.setText("断开中…")
+            self.connect_button.setEnabled(False)
+            self.connect_button.setText("断开中…")
             self.worker.requestInterruption()
 
     def _on_connected(self, name: str) -> None:
@@ -352,6 +358,8 @@ class MainWindow(QMainWindow):
         self._session_id = self.database.start_session(self.config.source, name)
         self._set_device_status("online", "● 设备在线")
         self.device_label.setText(name)
+        self.connect_button.setEnabled(True)
+        self.connect_button.setText("断开设备")
         self.settings_panel.set_connected(True)
         self.camera_view.set_record_enabled(True)
 
@@ -390,7 +398,12 @@ class MainWindow(QMainWindow):
             self.yaw_card.set_value(f"{yaw:.1f}°")
 
         self._update_tag_monitors(packet.samples, now)
-        self.camera_view.canvas.set_frame(packet.image_rgb, packet.tag_detections, self._tag_tones)
+        self.camera_view.canvas.set_frame(
+            packet.image_rgb,
+            packet.tag_detections,
+            self._tag_tones,
+            self._tag_direction_ids,
+        )
         if packet.image_rgb is not None:
             self._last_video_shape = (
                 int(packet.image_rgb.shape[0]),
@@ -425,6 +438,7 @@ class MainWindow(QMainWindow):
                 continue
             by_tag[tag_id] = sample
 
+        direction_ids: set[int] = set()
         for tag_id, card in self._tag_cards.items():
             if not card.running:
                 card.set_state(False, "danger")
@@ -476,7 +490,11 @@ class MainWindow(QMainWindow):
             severity = {"normal": 0, "proximity": 1, "danger": 2}
             tone = max((distance_tone, quality_tone, offset_tone), key=severity.__getitem__)
             self._tag_tones[tag_id] = tone
+            # 方向箭头与警告同源：相对初始基准的偏移超过卡片阈值才显示
+            if sample.valid and judged_offset >= profile.quality_threshold:
+                direction_ids.add(tag_id)
             card.update_values(sample.position_mm, offset_mm, variance_mm, tone)
+        self._tag_direction_ids = frozenset(direction_ids)
 
     def _on_monitor_toggled(self, tag_id: int, running: bool) -> None:
         current = self._tag_profiles[tag_id]
@@ -487,6 +505,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "监控状态保存失败", f"本次运行内生效，但未能写入数据库：{exc}")
         self._tag_profiles[tag_id] = updated
         self._tag_reference_positions.pop(tag_id, None)
+        # 基准位置重建时，画面内的初始像素基准也一并重建
+        self.camera_view.canvas.motion_tracker.reset_tag(tag_id)
         if running:
             self._tag_histories[tag_id] = deque()
             sample = self._last_samples.get(f"tag_{tag_id}")
@@ -755,6 +775,8 @@ class MainWindow(QMainWindow):
         self.settings_panel.finish_calibration()
         self.camera_view.set_record_enabled(False)
         self.camera_view.set_recording(False, 0)
+        self.connect_button.setEnabled(True)
+        self.connect_button.setText("连接设备")
 
     def _set_device_status(self, state: str, text: str) -> None:
         self.device_status.setText(text)
@@ -789,6 +811,7 @@ class MainWindow(QMainWindow):
         self._last_samples.clear()
         self._last_video_shape = None
         self._tag_tones.clear()
+        self._tag_direction_ids = frozenset()
         self._tag_reference_positions.clear()
         for history in self._tag_histories.values():
             history.clear()
@@ -839,6 +862,12 @@ class MainWindow(QMainWindow):
             #sourceSwitcher:disabled { color: #98A2B3; background: #F2F4F7; }
             #clockLabel { color: #3F4D5A; font-family: "Helvetica Neue"; font-size: 12px; }
             #deviceStatus { color: #5C6A78; font-size: 12px; font-weight: 500; }
+            #headerConnectButton {
+                background: #0049C0; color: #FFFFFF; border: 0; border-radius: 8px;
+                min-height: 34px; padding: 0 18px; font-size: 13px; font-weight: 600;
+            }
+            #headerConnectButton:hover { background: #003A99; }
+            #headerConnectButton:disabled { background: #7FA3D9; color: #FFFFFF; }
             #deviceStatus[state="online"] { color: #12B76A; }
             #deviceStatus[state="connecting"] { color: #FFB020; }
             #deviceStatus[state="danger"] { color: #E5484D; }
